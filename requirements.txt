@@ -1,0 +1,8 @@
+python-telegram-bot>=21.0
+Pillow>=10.4.0
+pypdfium2>=5.0.0
+XlsxWriter>=3.2.0
+python-dotenv>=1.0.1
+pytz>=2024.1
+pyzipper>=0.3.6
+rarfile>=4.5

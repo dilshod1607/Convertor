@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables & secrets
+.env
+
+# Database & Storage
+*.db
+*.sqlite3
+documents/
+users_export.xlsx
+
+# IDE & Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log

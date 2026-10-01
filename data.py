@@ -1,187 +1,231 @@
-import logging
 import sqlite3
+import logging
+from datetime import datetime
+import pytz
+import os
+import xlsxwriter as xl
+
+logger = logging.getLogger(__name__)
 
 class Database:
-    def __init__(self, path_to_db="main.db"):
+    """
+    SQLite ma'lumotlar bazasi bilan xavfsiz va tezkor ishlash klassi.
+    Eski va yangi baza strukturalarini avtomatik moslashtiradi (Auto-migration).
+    """
+    def __init__(self, path_to_db: str = "database.db"):
         self.path_to_db = path_to_db
-        self.create_table_users()
-        self.create_table_status()
-        self.create_table_channels()  # Create the channels table
+        self._init_db()
 
-    @property
-    def connection(self):
-        return sqlite3.connect(self.path_to_db)
+    def _get_connection(self):
+        return sqlite3.connect(self.path_to_db, timeout=20)
 
-    def execute(self, sql: str, parameters: tuple = None, fetchone=False, fetchall=False, commit=False):
-        if not parameters:
-            parameters = ()
+    def _init_db(self):
+        """Baza jadvallarini avtomatik yaratish va tuzilmani yangilash"""
         try:
-            with self.connection as conn:
+            with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(sql, parameters)
+                
+                # 1. Foydalanuvchilar jadvali
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    full_name TEXT,
+                    username TEXT,
+                    created_at TEXT
+                );
+                """)
+                
+                # Agar eski bazada created_at ustuni bo'lmasa qo'shamiz (Migration)
+                cursor.execute("PRAGMA table_info(users)")
+                columns = [c[1] for c in cursor.fetchall()]
+                if 'created_at' not in columns:
+                    cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
 
-                if commit:
-                    conn.commit()
-                if fetchall:
-                    return cursor.fetchall()
-                if fetchone:
-                    return cursor.fetchone()
+                # 2. Holat / Statistika jadvali
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS status (
+                    active INTEGER DEFAULT 0,
+                    block INTEGER DEFAULT 0
+                );
+                """)
+                cursor.execute("SELECT COUNT(*) FROM status")
+                if cursor.fetchone()[0] == 0:
+                    cursor.execute("INSERT INTO status (active, block) VALUES (0, 0)")
+
+                # 3. Homiylik kanallari jadvali
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS channels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    channel_id TEXT NOT NULL UNIQUE,
+                    link TEXT NOT NULL
+                );
+                """)
+                conn.commit()
         except sqlite3.Error as e:
-            logging.error(f"SQLite error: {e}")
-            raise
+            logger.error(f"Database initialization error: {e}")
 
-    def create_table_users(self):
+    def add_user(self, user_id: int, full_name: str, username: str = "") -> bool:
+        """Yangi foydalanuvchini bazaga qo'shish yoki yangilash"""
+        now = datetime.now(pytz.timezone('Asia/Tashkent')).strftime("%Y-%m-%d %H:%M:%S")
         sql = """
-        CREATE TABLE IF NOT EXISTS Users (
-            user_id INTEGER PRIMARY KEY,
-            full_name TEXT NOT NULL,
-            username TEXT
-        );
+        INSERT INTO users (user_id, full_name, username, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            full_name = excluded.full_name,
+            username = excluded.username;
         """
-        self.execute(sql, commit=True)
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, (user_id, full_name or "", username or "", now))
+                conn.commit()
+                return True
+        except sqlite3.Error as e:
+            logger.error(f"Error adding user {user_id}: {e}")
+            return False
 
-    def create_table_status(self):
-        sql = """
-        CREATE TABLE IF NOT EXISTS Status (
-            active INTEGER,
-            block INTEGER
-        );
-        """
-        self.execute(sql, commit=True)
+    def select_user(self, user_id: int):
+        """Foydalanuvchi ma'lumotlarini olish"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id, full_name, username FROM users WHERE user_id = ?", (user_id,))
+                return cursor.fetchone()
+        except sqlite3.Error as e:
+            logger.error(f"Error selecting user {user_id}: {e}")
+            return None
 
-    def create_table_channels(self):
-        sql = """
-        CREATE TABLE IF NOT EXISTS Channels (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            channel_id TEXT NOT NULL,
-            link TEXT NOT NULL
-        );
-        """
-        self.execute(sql, commit=True)
-
-    def drop_table_channels(self):
-        sql = "DROP TABLE IF EXISTS Channels;"
-        self.execute(sql, commit=True)
-
-    @staticmethod
-    def format_args(sql, parameters: dict):
-        if parameters:
-            sql += " AND ".join([f"{item} = ?" for item in parameters])
-        return sql, tuple(parameters.values())
-
-    def add_user(self, user_id: int, full_name: str, username: str):
-        sql = """
-        INSERT INTO Users (user_id, full_name, username) VALUES (?, ?, ?)
-        """
-        self.execute(sql, parameters=(user_id, full_name, username), commit=True)
+    def count_users(self) -> int:
+        """Jami foydalanuvchilar sonini aniq butun son (int) sifatida qaytaradi"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM users")
+                res = cursor.fetchone()
+                return res[0] if res else 0
+        except sqlite3.Error as e:
+            logger.error(f"Error counting users: {e}")
+            return 0
 
     def select_all_users(self):
-        sql = """
-        SELECT * FROM Users
-        """
-        return self.execute(sql, fetchall=True)
-
-    def select_user(self, **kwargs):
-        sql = "SELECT * FROM Users WHERE "
-        sql, parameters = self.format_args(sql, kwargs)
-        return self.execute(sql, parameters=parameters, fetchone=True)
-
-    def count_users(self):
-        sql = "SELECT COUNT(*) FROM Users;"
-        return self.execute(sql, fetchone=True)
-
-    def delete_users(self):
-        self.execute("DELETE FROM Users", commit=True)
-
-    def add_status(self, active: int = 0, block: int = 0):
-        sql = """
-        INSERT INTO Status (active, block) VALUES (?, ?)
-        """
-        self.execute(sql, parameters=(active, block), commit=True)
-
-    def select_block(self):
-        sql = "SELECT block FROM Status"
-        return self.execute(sql, fetchone=True)
-
-    def select_active(self):
-        sql = "SELECT active FROM Status"
-        return self.execute(sql, fetchone=True)
-
-    def update_block(self, block):
-        sql = "UPDATE Status SET block = ?"
-        self.execute(sql, parameters=(block,), commit=True)
-
-    def update_active(self, active):
-        sql = "UPDATE Status SET active = ?"
-        self.execute(sql, parameters=(active,), commit=True)
-
-    def add_channel(self, name: str, channel_id: str, link: str) -> bool:
-        """
-        Add a new channel to the database.
-        """
-        sql = "INSERT INTO Channels (name, channel_id, link) VALUES (?, ?, ?)"
+        """Barcha foydalanuvchilar ro'yxatini olish"""
         try:
-            self.execute(sql, parameters=(name, channel_id, link), commit=True)
-            return True
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id, full_name, username, created_at FROM users")
+                return cursor.fetchall()
         except sqlite3.Error as e:
-            logging.error(f"Failed to add channel: {e}")
-            return False
-
-    def select_all_channels(self):
-        sql = """
-        SELECT * FROM Channels
-        """
-        return self.execute(sql, fetchall=True)
-
-    def select_channel(self, **kwargs):
-        sql = "SELECT * FROM Channels WHERE "
-        sql, parameters = self.format_args(sql, kwargs)
-        return self.execute(sql, parameters=parameters, fetchone=True)
-
-    def select_all_channel(self):
-        sql = """
-        SELECT * FROM Channels
-        """
-        return self.execute(sql, fetchall=True)
-
-    def delete_channel_by_name(self, name: str) -> bool:
-        """
-        Delete a channel from t he database by its name.
-        """
-        sql = "DELETE FROM Channels WHERE name = ?"
-        try:
-            self.execute(sql, parameters=(name,), commit=True)
-            return True
-        except sqlite3.Error as e:
-            logging.error(f"Failed to delete channel: {e}")
-            return False
-
-    def is_subscribed(self, user_id: int, channel_url: str) -> bool:
-        # Query the database to check if the user is subscribed to the given channel
-        # Return True if subscribed, False otherwise
-        # Example implementation:
-        query = "SELECT COUNT(*) FROM subscriptions WHERE user_id = ? AND channel_url = ?"
-        result = self.execute_query(query, (user_id, channel_url))
-        return result[0] > 0
-
-    def get_channels_from_db(self):
-        """
-        Fetch all channels from the database and return them as a list of tuples
-        containing (channel name, channel ID, channel link).
-        """
-        try:
-            channels = self.select_all_channels()
-            return [(channel[1], channel[2], channel[3]) for channel in channels]
-        except sqlite3.Error as e:
-            logging.error(f"Failed to fetch channels: {e}")
+            logger.error(f"Error selecting all users: {e}")
             return []
 
-# Configure logging
-logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
+    def get_status(self):
+        """Aktiv va bloklangan foydalanuvchilar sonini olish"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT active, block FROM status LIMIT 1")
+                res = cursor.fetchone()
+                if res:
+                    return res[0], res[1]
+                return 0, 0
+        except sqlite3.Error as e:
+            logger.error(f"Error getting status: {e}")
+            return 0, 0
 
-# Example usage:
-if __name__ == "__main__":
-    db = Database()
-    channels = db.get_channels_from_db()
-    print(channels)
+    def update_status(self, active: int, block: int):
+        """Aktiv va blok statistikani yangilash"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE status SET active = ?, block = ?", (active, block))
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error updating status: {e}")
+
+    def add_channel(self, name: str, channel_id: str, link: str) -> bool:
+        """Yangi majburiy a'zolik kanalini qo'shish"""
+        sql = "INSERT INTO channels (name, channel_id, link) VALUES (?, ?, ?)"
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, (name.strip(), channel_id.strip(), link.strip()))
+                conn.commit()
+                return True
+        except sqlite3.IntegrityError:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE channels SET name = ?, link = ? WHERE channel_id = ?", (name.strip(), link.strip(), channel_id.strip()))
+                conn.commit()
+                return True
+        except sqlite3.Error as e:
+            logger.error(f"Error adding channel: {e}")
+            return False
+
+    def get_channels_from_db(self):
+        """Barcha kanallarni ro'yxat sifatida olish: [(name, channel_id, link, id), ...]"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT name, channel_id, link, id FROM channels")
+                return cursor.fetchall()
+        except sqlite3.Error as e:
+            logger.error(f"Error fetching channels: {e}")
+            return []
+
+    def delete_channel_by_id(self, channel_db_id: int) -> bool:
+        """Kanalni IDsi bo'yicha o'chirish"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM channels WHERE id = ?", (channel_db_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Error deleting channel {channel_db_id}: {e}")
+            return False
+
+    def export_users_to_excel(self, output_path: str = "users.xlsx") -> str:
+        """Foydalanuvchilar ro'yxatini chiroyli Excel faylga eksport qilish"""
+        users = self.select_all_users()
+        workbook = xl.Workbook(output_path)
+        worksheet = workbook.add_worksheet("Foydalanuvchilar")
+
+        header_format = workbook.add_format({
+            'bold': True,
+            'align': 'center',
+            'valign': 'vcenter',
+            'fg_color': '#3b82f6',
+            'font_color': '#ffffff',
+            'border': 1
+        })
+        cell_format = workbook.add_format({'align': 'left', 'valign': 'vcenter', 'border': 1})
+        num_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1})
+
+        worksheet.set_column('A:A', 8)
+        worksheet.set_column('B:B', 18)
+        worksheet.set_column('C:C', 30)
+        worksheet.set_column('D:D', 22)
+        worksheet.set_column('E:E', 22)
+
+        worksheet.write('A1', 'T/r', header_format)
+        worksheet.write('B1', 'User ID', header_format)
+        worksheet.write('C1', 'F.I.SH / Ism', header_format)
+        worksheet.write('D1', 'Username', header_format)
+        worksheet.write('E1', "Qo'shilgan sana", header_format)
+
+        for idx, user in enumerate(users, start=1):
+            row = idx + 1
+            user_id = user[0]
+            fullname = user[1] if len(user) > 1 else ""
+            username = f"@{user[2]}" if len(user) > 2 and user[2] else "-"
+            created_at = user[3] if len(user) > 3 and user[3] else "-"
+
+            worksheet.write(f'A{row}', idx, num_format)
+            worksheet.write(f'B{row}', user_id, num_format)
+            worksheet.write(f'C{row}', fullname, cell_format)
+            worksheet.write(f'D{row}', username, cell_format)
+            worksheet.write(f'E{row}', created_at, num_format)
+
+        workbook.close()
+        return output_path
