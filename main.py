@@ -46,6 +46,7 @@ from converter import (
     get_user_dir,
     convert_images_to_pdf,
     convert_pdf_to_images,
+    create_custom_pdf,
     merge_pdf_files,
     compress_pdf,
     convert_text_to_pdf,
@@ -2112,9 +2113,77 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     # Boshqa hollarda foydalanuvchiga yo'riqnoma
     await update.message.reply_html(
         "ℹ️ <b>Faylni konvertatsiya qilish yoki arxivni ochish uchun:</b>\n\n"
-        "1. Rasmlar, PDF yoki ZIP/RAR arxiv yuboring.\n"
+        "1. Rasmlar, PDF, Word/Excel yoki ZIP/RAR arxiv yuboring.\n"
         "2. Chiqqan menyudan kerakli amalni tanlang."
     )
+
+
+async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram Mini App (WebApp) dan kelgan ma'lumotlarni qabul qilib, moslashtirilgan PDF yaratish"""
+    message = update.effective_message
+    if not message or not message.web_app_data:
+        return
+
+    user_id = update.effective_user.id
+    raw_data = message.web_app_data.data
+    sess = get_user_session(user_id)
+
+    try:
+        config = json.loads(raw_data)
+    except Exception:
+        await message.reply_html("❌ <b>Mini App ma'lumotlarini o'qishda xatolik yuz berdi.</b>")
+        return
+
+    pages_config = config.get('pages', [])
+    settings = config.get('settings', {})
+    photo_items = [it for it in sess['items'] if it['type'] == 'photo']
+
+    if not photo_items:
+        await message.reply_html("❌ Siz hali birorta ham rasm yubormagansiz!")
+        return
+
+    status_msg = await message.reply_html("⚙️ <b>Mini App buyurtmasi asosida PDF yaratilmoqda...</b>")
+    user_dir = get_user_dir(DOCUMENTS_DIR, user_id)
+
+    # 1. Rasmlarni yuklab olish
+    image_paths = await _download_session_items(context.bot, photo_items, user_dir, status_msg)
+    
+    # 2. Ordered items tuzish
+    ordered_items = []
+    for idx, p_path in enumerate(image_paths):
+        rot = 0
+        if idx < len(pages_config):
+            rot = pages_config[idx].get('rotation', 0)
+        ordered_items.append({'path': p_path, 'rotation': rot})
+
+    output_pdf = os.path.join(user_dir, f"custom_{user_id}_{int(time.time())}.pdf")
+    loop = asyncio.get_running_loop()
+    async with CONVERT_SEMAPHORE:
+        success = await loop.run_in_executor(None, create_custom_pdf, ordered_items, output_pdf, settings)
+
+    if success and os.path.exists(output_pdf):
+        with open(output_pdf, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=user_id,
+                document=f,
+                filename=f"Convertor_Custom_{len(ordered_items)}_sahifa.pdf",
+                caption=(
+                    f"✅ <b>Sizning Mini App orqali sozlangan PDF hujjatingiz tayyor!</b>\n\n"
+                    f"📄 <b>Sahifalar:</b> {len(ordered_items)} ta\n"
+                    f"💾 <b>Hajmi:</b> {format_file_size(os.path.getsize(output_pdf))}\n"
+                    f"🤖 @convertorai_bot"
+                ),
+                parse_mode='HTML'
+            )
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+    else:
+        await status_msg.edit_text("❌ PDF yaratishda xatolik yuz berdi.")
+
+    cleanup_user_files(user_dir)
+    reset_user_session(user_id)
 
 
 # =========================================================================
@@ -2244,6 +2313,9 @@ def main():
 
     # Foydalanuvchi fayllarini qabul qilish (Rasm, Hujjat, Video, Audio, Voice)
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.VOICE, handle_user_files))
+
+    # Mini App (WebApp) dan kelgan sozlamalarni qabul qilish
+    application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data))
 
     # Matnli xabarlarni qabul qilish (Arxiv paroli va boshqalar)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))

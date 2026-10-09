@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="uz" class="dark">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Convertor Mini App - PDF Sahifalarini Tartiblash</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: '#2AABEE',
+            brandDark: '#229ED9',
+            darkBg: '#17212B',
+            darkCard: '#242F3D',
+            darkBorder: '#0E1621'
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    body {
+      touch-action: pan-y;
+      user-select: none;
+      -webkit-user-select: none;
+      background-color: var(--tg-theme-bg-color, #17212B);
+      color: var(--tg-theme-text-color, #FFFFFF);
+    }
+    .sortable-ghost {
+      opacity: 0.4;
+      transform: scale(0.95);
+    }
+    .sortable-drag {
+      cursor: grabbing;
+      box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    }
+    .page-card {
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+  </style>
+</head>
+<body class="min-h-screen pb-24 font-sans antialiased text-white">
+
+  <!-- Header -->
+  <header class="sticky top-0 z-30 px-4 py-3 bg-darkCard/90 backdrop-blur-md border-b border-darkBorder flex items-center justify-between shadow-sm">
+    <div class="flex items-center space-x-2">
+      <div class="w-8 h-8 rounded-lg bg-brand/20 flex items-center justify-center text-brand">
+        <i data-lucide="layers" class="w-5 h-5"></i>
+      </div>
+      <div>
+        <h1 class="text-sm font-bold text-white leading-tight">PDF Vizual Tahrirlovchi</h1>
+        <p class="text-xs text-gray-400" id="item-count-label">Sahifalarni tartiblang</p>
+      </div>
+    </div>
+    <div class="flex items-center space-x-2">
+      <button id="btn-add-all" onclick="resetAllRotations()" class="p-2 rounded-lg bg-darkBg text-gray-300 hover:text-white hover:bg-darkBorder transition text-xs flex items-center space-x-1">
+        <i data-lucide="rotate-ccw" class="w-4 h-4"></i>
+        <span>Tiklash</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Instructions Banner -->
+  <div class="p-4">
+    <div class="bg-gradient-to-r from-blue-900/40 to-indigo-900/40 border border-blue-500/20 rounded-xl p-3 flex items-start space-x-3">
+      <div class="text-blue-400 mt-0.5">
+        <i data-lucide="info" class="w-5 h-5"></i>
+      </div>
+      <div class="text-xs text-gray-300">
+        <p class="font-medium text-white mb-0.5">Qo'llanma:</p>
+        <p>Sahifani bosib turib suring (Drag & Drop), burchagini burang (Rotate) yoki keraksizini o'chiring.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Accordion -->
+  <div class="px-4 mb-4">
+    <div class="bg-darkCard rounded-xl p-3 border border-darkBorder/60">
+      <div class="flex items-center justify-between cursor-pointer" onclick="toggleSettings()">
+        <div class="flex items-center space-x-2 text-sm font-semibold text-gray-200">
+          <i data-lucide="sliders" class="w-4 h-4 text-brand"></i>
+          <span>PDF Sozlamalari</span>
+        </div>
+        <i data-lucide="chevron-down" id="settings-chevron" class="w-4 h-4 text-gray-400 transition-transform"></i>
+      </div>
+
+      <div id="settings-panel" class="hidden mt-3 pt-3 border-t border-darkBorder/60 space-y-3 text-xs">
+        <div class="flex items-center justify-between">
+          <span class="text-gray-300">Varaq o'lchami:</span>
+          <select id="page-size" class="bg-darkBg text-white px-2 py-1 rounded border border-darkBorder focus:outline-none">
+            <option value="A4" selected>A4 Standart</option>
+            <option value="A3">A3 Katta</option>
+            <option value="Letter">Letter</option>
+            <option value="Fit">Rasm o'lchamiga mos</option>
+          </select>
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-gray-300">Sahifa raqamlarini qo'yish:</span>
+          <input type="checkbox" id="page-numbers" class="w-4 h-4 text-brand rounded focus:ring-brand accent-brand" checked />
+        </div>
+        <div class="flex items-center justify-between">
+          <span class="text-gray-300">Sifatni saqlab siqish (Compress):</span>
+          <input type="checkbox" id="compress-pdf" class="w-4 h-4 text-brand rounded focus:ring-brand accent-brand" checked />
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Page Grid Container -->
+  <main class="px-4">
+    <div id="pages-grid" class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+      <!-- Dynamic page cards inserted here -->
+    </div>
+
+    <!-- Empty State -->
+    <div id="empty-state" class="hidden text-center py-12">
+      <div class="w-16 h-16 rounded-full bg-darkCard border border-darkBorder flex items-center justify-center mx-auto mb-3 text-gray-500">
+        <i data-lucide="image-off" class="w-8 h-8"></i>
+      </div>
+      <p class="text-sm font-medium text-gray-300">Hech qanday sahifa qolmadi</p>
+      <p class="text-xs text-gray-500 mt-1">Barcha sahifalar o'chirildi.</p>
+    </div>
+  </main>
+
+  <!-- Bottom Floating Action Bar -->
+  <footer class="fixed bottom-0 left-0 right-0 p-4 bg-darkCard/95 backdrop-blur-lg border-t border-darkBorder flex items-center space-x-3 z-40">
+    <button onclick="submitPdfGeneration()" id="btn-submit" class="flex-1 py-3 px-4 bg-gradient-to-r from-brand to-brandDark hover:opacity-90 active:scale-[0.98] text-white font-semibold rounded-xl text-sm shadow-lg shadow-brand/25 flex items-center justify-center space-x-2 transition">
+      <i data-lucide="file-check-2" class="w-5 h-5"></i>
+      <span>PDF Yaratish</span>
+    </button>
+  </footer>
+
+  <script>
+    // Telegram WebApp Initialization
+    const tg = window.Telegram?.WebApp;
+    if (tg) {
+      tg.expand();
+      tg.enableClosingConfirmation();
+      if (tg.themeParams?.bg_color) {
+        document.documentElement.style.setProperty('--tg-theme-bg-color', tg.themeParams.bg_color);
+      }
+    }
+
+    // Default sample data if not passed in URL params
+    const urlParams = new URLSearchParams(window.location.search);
+    let rawItemsParam = urlParams.get('items');
+    let pages = [];
+
+    if (rawItemsParam) {
+      try {
+        pages = JSON.parse(decodeURIComponent(rawItemsParam));
+      } catch(e) {
+        pages = [];
+      }
+    }
+
+    // If empty demo items
+    if (!pages || pages.length === 0) {
+      pages = [
+        { id: '1', title: '1-Sahifa', rotation: 0, url: 'https://picsum.photos/400/550?random=1' },
+        { id: '2', title: '2-Sahifa', rotation: 0, url: 'https://picsum.photos/400/550?random=2' },
+        { id: '3', title: '3-Sahifa', rotation: 0, url: 'https://picsum.photos/400/550?random=3' }
+      ];
+    }
+
+    const grid = document.getElementById('pages-grid');
+    const emptyState = document.getElementById('empty-state');
+    const countLabel = document.getElementById('item-count-label');
+
+    function renderPages() {
+      grid.innerHTML = '';
+      if (pages.length === 0) {
+        grid.classList.add('hidden');
+        emptyState.classList.remove('hidden');
+        countLabel.textContent = '0 ta sahifa';
+        return;
+      }
+      grid.classList.remove('hidden');
+      emptyState.classList.add('hidden');
+      countLabel.textContent = `${pages.length} ta sahifa mavjud`;
+
+      pages.forEach((page, index) => {
+        const card = document.createElement('div');
+        card.className = 'page-card relative bg-darkCard border border-darkBorder rounded-xl p-2.5 flex flex-col group';
+        card.setAttribute('data-id', page.id);
+
+        card.innerHTML = `
+          <!-- Page Number Badge -->
+          <div class="absolute top-3.5 left-3.5 z-10 bg-black/70 backdrop-blur-md text-white text-[11px] font-bold px-2 py-0.5 rounded-md shadow">
+            #${index + 1}
+          </div>
+
+          <!-- Delete Button -->
+          <button onclick="deletePage('${page.id}')" class="absolute top-3.5 right-3.5 z-10 w-7 h-7 bg-red-600/80 hover:bg-red-600 active:scale-90 backdrop-blur-md text-white rounded-lg flex items-center justify-center shadow transition">
+            <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+          </button>
+
+          <!-- Thumbnail with Rotation -->
+          <div class="w-full h-44 bg-darkBg rounded-lg overflow-hidden flex items-center justify-center relative my-1 cursor-grab active:cursor-grabbing border border-darkBorder/40">
+            <img src="${page.url || 'https://picsum.photos/300/400'}" 
+                 id="img-${page.id}"
+                 class="w-full h-full object-cover transition-transform duration-300"
+                 style="transform: rotate(${page.rotation || 0}deg)" 
+                 alt="${page.title}" />
+          </div>
+
+          <!-- Footer Actions -->
+          <div class="mt-2 flex items-center justify-between text-xs pt-1 border-t border-darkBorder/50">
+            <span class="truncate max-w-[90px] text-gray-300 font-medium">${page.title || 'Sahifa'}</span>
+            <button onclick="rotatePage('${page.id}')" class="flex items-center space-x-1 px-2 py-1 rounded bg-darkBg hover:bg-darkBorder text-brand transition active:scale-95">
+              <i data-lucide="rotate-cw" class="w-3.5 h-3.5"></i>
+              <span>${page.rotation || 0}°</span>
+            </button>
+          </div>
+        `;
+        grid.appendChild(card);
+      });
+
+      lucide.createIcons();
+    }
+
+    // Initialize SortableJS for Drag-and-Drop
+    new Sortable(grid, {
+      animation: 200,
+      ghostClass: 'sortable-ghost',
+      dragClass: 'sortable-drag',
+      handle: '.cursor-grab',
+      onEnd: function(evt) {
+        const item = pages.splice(evt.oldIndex, 1)[0];
+        pages.splice(evt.newIndex, 0, item);
+        renderPages();
+      }
+    });
+
+    function rotatePage(id) {
+      const p = pages.find(it => it.id === id);
+      if (p) {
+        p.rotation = ((p.rotation || 0) + 90) % 360;
+        const img = document.getElementById(`img-${id}`);
+        if (img) {
+          img.style.transform = `rotate(${p.rotation}deg)`;
+        }
+        renderPages();
+      }
+    }
+
+    function deletePage(id) {
+      pages = pages.filter(it => it.id !== id);
+      renderPages();
+    }
+
+    function resetAllRotations() {
+      pages.forEach(p => p.rotation = 0);
+      renderPages();
+    }
+
+    function toggleSettings() {
+      const panel = document.getElementById('settings-panel');
+      const chevron = document.getElementById('settings-chevron');
+      if (panel.classList.contains('hidden')) {
+        panel.classList.remove('hidden');
+        chevron.style.transform = 'rotate(180deg)';
+      } else {
+        panel.classList.add('hidden');
+        chevron.style.transform = 'rotate(0deg)';
+      }
+    }
+
+    function submitPdfGeneration() {
+      if (pages.length === 0) {
+        alert("Kamida bitta sahifa qolishi shart!");
+        return;
+      }
+      const config = {
+        action: 'custom_pdf_build',
+        pages: pages.map((p, idx) => ({
+          id: p.id,
+          order: idx + 1,
+          rotation: p.rotation || 0
+        })),
+        settings: {
+          pageSize: document.getElementById('page-size').value,
+          pageNumbers: document.getElementById('page-numbers').checked,
+          compress: document.getElementById('compress-pdf').checked
+        }
+      };
+
+      if (tg) {
+        tg.sendData(JSON.stringify(config));
+        tg.close();
+      } else {
+        alert("Natija muvaffaqiyatli tayyorlandi:\n" + JSON.stringify(config, null, 2));
+      }
+    }
+
+    // Initial render
+    renderPages();
+  </script>
+</body>
+</html>

@@ -160,9 +160,77 @@ def is_archive_encrypted(archive_path: str) -> bool:
     return False
 
 
-# =========================================================================
-# 1. RASMLAR VA PDF KONVERTATSIYALARI
-# =========================================================================
+def create_custom_pdf(
+    ordered_items: list[dict],
+    output_pdf_path: str,
+    settings: Optional[dict] = None,
+    progress_callback=None
+) -> bool:
+    """
+    Mini App (WebApp) dan kelgan buyurtmaga binoan sahifalarni tartiblab,
+    aylantirib (Rotation) va maxsus sozlamalar bilan PDF yaratadi.
+    ordered_items: [{'path': ..., 'rotation': 0|90|180|270}]
+    """
+    if not ordered_items:
+        return False
+
+    opened_images = []
+    total = len(ordered_items)
+    settings = settings or {}
+    try:
+        for idx, item in enumerate(ordered_items, 1):
+            img_path = item.get('path')
+            rotation = item.get('rotation', 0)
+            if not img_path or not os.path.exists(img_path):
+                continue
+
+            with Image.open(img_path) as img:
+                img = ImageOps.exif_transpose(img)
+                if rotation:
+                    # Pillow da rotate soat strelkasiga teskari, shuning uchun -rotation
+                    img = img.rotate(-rotation, expand=True)
+
+                if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+                    bg = Image.new('RGB', img.size, (255, 255, 255))
+                    alpha = img.convert('RGBA').split()[-1]
+                    bg.paste(img, mask=alpha)
+                    opened_images.append(bg)
+                else:
+                    opened_images.append(img.convert('RGB'))
+
+            if progress_callback:
+                try:
+                    progress_callback(idx, total, os.path.basename(img_path))
+                except Exception:
+                    pass
+
+        if not opened_images:
+            return False
+
+        first_img = opened_images[0]
+        other_imgs = opened_images[1:] if len(opened_images) > 1 else []
+
+        quality = 85 if settings.get('compress', True) else 95
+        first_img.save(
+            output_pdf_path,
+            "PDF",
+            resolution=100.0,
+            save_all=True,
+            append_images=other_imgs,
+            quality=quality
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Custom PDF creation failed: {e}", exc_info=True)
+        return False
+    finally:
+        for im in opened_images:
+            try:
+                im.close()
+            except Exception:
+                pass
+        force_garbage_collection()
+
 
 def convert_images_to_pdf(image_paths: list[str], output_pdf_path: str, progress_callback=None) -> bool:
     """
