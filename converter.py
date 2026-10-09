@@ -7,6 +7,7 @@ import shutil
 import logging
 import subprocess
 import gc
+from typing import Optional, List, Dict, Tuple, Any
 from PIL import Image, ImageOps
 import pypdfium2 as pdfium
 import pymupdf
