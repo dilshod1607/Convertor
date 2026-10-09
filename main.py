@@ -50,6 +50,9 @@ from converter import (
     compress_pdf,
     convert_text_to_pdf,
     convert_media_to_mp3,
+    convert_video_to_gif,
+    convert_office_to_pdf,
+    extract_text_ocr,
     create_zip_archive,
     extract_archive,
     is_archive_encrypted,
@@ -65,6 +68,7 @@ from keyboards import (
     get_back_keyboard,
     get_channels_manage_keyboard
 )
+from session_manager import session_manager
 
 # Parallel og'ir konvertatsiyalar chegarasi (VPS xotirasini tejash uchun)
 CONVERT_SEMAPHORE = asyncio.Semaphore(3)
@@ -82,9 +86,6 @@ logger = logging.getLogger(__name__)
 os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 db = Database(path_to_db=DATABASE_PATH)
 
-# Foydalanuvchi sessiyalari
-user_sessions = {}
-
 # Admin holatlari (States)
 ADMIN_BROADCAST_STATE = 1
 ADMIN_ADD_CH_NAME = 2
@@ -93,23 +94,24 @@ ADMIN_ADD_CH_LINK = 4
 
 
 def get_user_session(user_id: int) -> dict:
-    """Foydalanuvchi sessiyasini olish yoki yangisini yaratish"""
-    if user_id not in user_sessions:
-        user_sessions[user_id] = {
-            'items': [],  # [{'type': 'photo'|'pdf'|'archive'|'doc', 'file_id': ..., 'file_name': ..., 'file_size': ...}]
+    """Foydalanuvchi sessiyasini olish (Redis va Memory bilan sinxron)"""
+    if user_id not in session_manager._memory_cache:
+        session_manager._memory_cache[user_id] = {
+            'items': [],
             'menu_msg_id': None,
             'chat_id': None,
             'update_task': None,
-            'lock': asyncio.Lock(),
+            'lock': session_manager.get_lock(user_id),
             'waiting_for_password': False,
             'archive_paths': None,
             'extract_dir': None,
             'user_dir': None,
-            'progress_msg_id': None
+            'progress_msg_id': None,
+            'ocr_lang': 'uzb+rus+eng'
         }
-    elif 'lock' not in user_sessions[user_id]:
-        user_sessions[user_id]['lock'] = asyncio.Lock()
-    return user_sessions[user_id]
+    elif 'lock' not in session_manager._memory_cache[user_id]:
+        session_manager._memory_cache[user_id]['lock'] = session_manager.get_lock(user_id)
+    return session_manager._memory_cache[user_id]
 
 
 def reset_user_session(user_id: int):
@@ -125,6 +127,8 @@ def reset_user_session(user_id: int):
     sess['extract_dir'] = None
     sess['user_dir'] = None
     sess['progress_msg_id'] = None
+    if session_manager.redis_client:
+        asyncio.create_task(session_manager.reset_session(user_id))
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -306,27 +310,35 @@ async def _delayed_update_menu(bot, user_id: int, chat_id: int):
 
         photos = [it for it in sess['items'] if it['type'] == 'photo']
         pdfs = [it for it in sess['items'] if it['type'] == 'pdf']
+        offices = [it for it in sess['items'] if it['type'] == 'office']
         archives = [it for it in sess['items'] if it['type'] == 'archive']
-        medias = [it for it in sess['items'] if it['type'] == 'media']
+        medias = [it for it in sess['items'] if it['type'] in ('media', 'video', 'audio')]
+        videos = [it for it in sess['items'] if it['type'] == 'video']
         texts = [it for it in sess['items'] if it['type'] == 'text']
         docs = [it for it in sess['items'] if it['type'] == 'doc']
 
         photo_count = len(photos)
         pdf_count = len(pdfs)
+        office_count = len(offices)
         archive_count = len(archives)
         media_count = len(medias)
+        video_count = len(videos)
         text_count = len(texts)
         doc_count = len(docs)
 
         status_lines = ["📥 <b>Fayllar qabul qilindi:</b>"]
         if photo_count > 0:
-            status_lines.append(f"• 🖼 <b>Rasmlar:</b> {photo_count} ta")
+            status_lines.append(f"• 🖼 <b>Rasmlar (JPG/PNG/HEIC):</b> {photo_count} ta")
+        if office_count > 0:
+            for o in offices:
+                status_lines.append(f"• 📄 <b>Office hujjati:</b> <code>{o['file_name']}</code> {format_file_size(o['file_size'])}")
         if pdf_count > 0:
             for p in pdfs:
-                status_lines.append(f"• 📄 <b>PDF:</b> <code>{p['file_name']}</code> {format_file_size(p['file_size'])}")
+                status_lines.append(f"• 📑 <b>PDF:</b> <code>{p['file_name']}</code> {format_file_size(p['file_size'])}")
         if media_count > 0:
             for m in medias:
-                status_lines.append(f"• 🎵 <b>Media (Audio/Video):</b> <code>{m['file_name']}</code> {format_file_size(m['file_size'])}")
+                icon = "🎞" if m['type'] == 'video' else "🎵"
+                status_lines.append(f"• {icon} <b>Media:</b> <code>{m['file_name']}</code> {format_file_size(m['file_size'])}")
         if text_count > 0:
             for t in texts:
                 status_lines.append(f"• 📝 <b>Matn/Kod fayli:</b> <code>{t['file_name']}</code> {format_file_size(t['file_size'])}")
@@ -345,7 +357,9 @@ async def _delayed_update_menu(bot, user_id: int, chat_id: int):
             pdf_count=pdf_count,
             archive_count=archive_count,
             media_count=media_count,
-            text_count=text_count
+            text_count=text_count,
+            office_count=office_count,
+            video_count=video_count
         )
 
         # Yangi fayllar kelganda eski menyu xabari tepada qolib ketmasligi uchun
@@ -365,13 +379,15 @@ async def _delayed_update_menu(bot, user_id: int, chat_id: int):
             )
             sess['menu_msg_id'] = sent.message_id
             sess['chat_id'] = chat_id
+            if session_manager.redis_client:
+                asyncio.create_task(session_manager.save_session(user_id))
         except Exception as e:
             logger.error(f"Menyu xabarini yuborishda xatolik: {e}")
 
 
 async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Foydalanuvchi yuborgan rasm, PDF, ZIP, RAR, 7Z, Audio, Video, Matn va boshqa fayllarni qabul qilish.
+    Foydalanuvchi yuborgan rasm, PDF, Word, Excel, PowerPoint, ZIP, RAR, 7Z, Audio, Video, Matn fayllarini qabul qilish.
     """
     message = update.message
     if not message:
@@ -400,7 +416,7 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not any(it['file_unique_id'] == vid.file_unique_id for it in sess['items']):
             safe_name = vid.file_name or f"video_{vid.file_unique_id}.mp4"
             sess['items'].append({
-                'type': 'media',
+                'type': 'video',
                 'file_id': vid.file_id,
                 'file_unique_id': vid.file_unique_id,
                 'file_name': safe_name,
@@ -413,7 +429,7 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not any(it['file_unique_id'] == aud.file_unique_id for it in sess['items']):
             safe_name = getattr(aud, 'file_name', None) or f"audio_{aud.file_unique_id}.mp3"
             sess['items'].append({
-                'type': 'media',
+                'type': 'audio',
                 'file_id': aud.file_id,
                 'file_unique_id': aud.file_unique_id,
                 'file_name': safe_name,
@@ -429,15 +445,21 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mime = (doc.mime_type or "").lower()
 
             archive_exts = ('.zip', '.rar', '.7z', '.tar', '.gz', '.tgz', '.bz2', '.xz')
-            text_exts = ('.txt', '.md', '.py', '.js', '.json', '.csv', '.log', '.html', '.css', '.c', '.cpp', '.java', '.sql', '.xml', '.sh', '.bat', '.env', '.yaml', '.yml')
-            media_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.wma', '.opus')
+            office_exts = ('.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt', '.rtf', '.odt', '.ods', '.odp', '.csv')
+            text_exts = ('.txt', '.md', '.py', '.js', '.json', '.log', '.html', '.css', '.c', '.cpp', '.java', '.sql', '.xml', '.sh', '.bat', '.env', '.yaml', '.yml')
+            video_exts = ('.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm')
+            audio_exts = ('.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.wma', '.opus')
 
             if lower_name.endswith(archive_exts) or mime in ['application/zip', 'application/x-zip-compressed', 'application/x-rar-compressed', 'application/vnd.rar', 'application/x-7z-compressed']:
                 f_type = 'archive'
+            elif lower_name.endswith(office_exts) or 'officedocument' in mime or 'msword' in mime or 'ms-excel' in mime or 'ms-powerpoint' in mime:
+                f_type = 'office'
             elif lower_name.endswith('.pdf') or mime == 'application/pdf':
                 f_type = 'pdf'
-            elif lower_name.endswith(media_exts) or mime.startswith(('video/', 'audio/')):
-                f_type = 'media'
+            elif lower_name.endswith(video_exts) or mime.startswith('video/'):
+                f_type = 'video'
+            elif lower_name.endswith(audio_exts) or mime.startswith('audio/'):
+                f_type = 'audio'
             elif lower_name.endswith(text_exts) or mime.startswith('text/'):
                 f_type = 'text'
             elif mime.startswith('image/') or lower_name.endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.heif', '.tiff')):
@@ -452,6 +474,9 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'file_name': safe_name,
                 'file_size': doc.file_size or 0
             })
+
+    if session_manager.redis_client:
+        asyncio.create_task(session_manager.save_session(user_id))
 
     # Agar oldingi yangilanish vazifasi bo'lsa, bekor qilib yangisini boshlaymiz (Debounce)
     if sess.get('update_task') and not sess['update_task'].done():
@@ -1046,6 +1071,269 @@ async def media_to_mp3_callback(update: Update, context: ContextTypes.DEFAULT_TY
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"⚠️ {os.path.basename(m_path)} faylini MP3 ga o'girib bo'lmadi."
+            )
+        await asyncio.sleep(0.3)
+
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
+
+    cleanup_user_files(user_dir)
+    reset_user_session(user_id)
+
+
+async def office_to_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Word, Excel, PowerPoint hujjatlarini PDF ga aylantirish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = query.from_user.id
+    sess = get_user_session(user_id)
+
+    office_items = [it for it in sess['items'] if it['type'] == 'office']
+    if not office_items:
+        await query.message.reply_text("❌ Office hujjati topilmadi!")
+        return
+
+    sess['menu_msg_id'] = None
+    initial_progress = build_progress_bar(
+        current=0,
+        total=len(office_items),
+        title="Office hujjati yuklanmoqda...",
+        current_info="Tayyorlanmoqda..."
+    )
+    try:
+        await query.message.edit_text(initial_progress, parse_mode='HTML')
+        progress_msg = query.message
+    except Exception:
+        progress_msg = await query.message.reply_html(initial_progress)
+    user_dir = get_user_dir(DOCUMENTS_DIR, user_id)
+
+    # 1. Yuklab olish
+    office_paths = await _download_session_items(context.bot, office_items, user_dir, progress_msg)
+
+    # 2. PDF ga o'tkazish
+    start_time = time.time()
+    loop = asyncio.get_running_loop()
+
+    for idx, o_path in enumerate(office_paths, 1):
+        try:
+            await progress_msg.edit_text(
+                build_progress_bar(
+                    current=idx,
+                    total=len(office_paths),
+                    title="Office PDF ga aylantirilmoqda...",
+                    current_info=os.path.basename(o_path),
+                    start_time=start_time
+                ),
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+
+        async with CONVERT_SEMAPHORE:
+            res_pdf = await loop.run_in_executor(None, convert_office_to_pdf, o_path, user_dir)
+
+        if res_pdf and os.path.exists(res_pdf):
+            clean_name = os.path.basename(o_path)
+            if "_" in clean_name:
+                clean_name = clean_name.split("_", 1)[1]
+            base_title = os.path.splitext(clean_name)[0]
+
+            with open(res_pdf, 'rb') as pdf_file:
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=pdf_file,
+                    filename=f"{base_title}.pdf",
+                    caption=(
+                        f"✅ <b>Office hujjati PDF ga muvaffaqiyatli o'girildi!</b>\n\n"
+                        f"📄 <b>Asl fayl:</b> <code>{clean_name}</code>\n"
+                        f"💾 <b>Hajmi:</b> {format_file_size(os.path.getsize(res_pdf))}\n"
+                        f"🤖 @convertorai_bot"
+                    ),
+                    parse_mode='HTML',
+                    read_timeout=120.0,
+                    write_timeout=120.0
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ {os.path.basename(o_path)} faylini PDF ga o'tkazib bo'lmadi."
+            )
+        await asyncio.sleep(0.3)
+
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
+
+    cleanup_user_files(user_dir)
+    reset_user_session(user_id)
+
+
+async def ocr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Rasm yoki PDF dagi matnni tanib ajratib olish (OCR)"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = query.from_user.id
+    sess = get_user_session(user_id)
+
+    ocr_items = [it for it in sess['items'] if it['type'] in ('photo', 'pdf')]
+    if not ocr_items:
+        await query.message.reply_text("❌ Matn ajratish uchun rasm yoki PDF topilmadi!")
+        return
+
+    sess['menu_msg_id'] = None
+    initial_progress = build_progress_bar(
+        current=0,
+        total=len(ocr_items),
+        title="Fayl yuklanmoqda...",
+        current_info="OCR dvigateli tayyorlanmoqda..."
+    )
+    try:
+        await query.message.edit_text(initial_progress, parse_mode='HTML')
+        progress_msg = query.message
+    except Exception:
+        progress_msg = await query.message.reply_html(initial_progress)
+    user_dir = get_user_dir(DOCUMENTS_DIR, user_id)
+
+    # 1. Yuklab olish
+    file_paths = await _download_session_items(context.bot, ocr_items, user_dir, progress_msg)
+
+    # 2. OCR Matn tanish
+    start_time = time.time()
+    loop = asyncio.get_running_loop()
+
+    for idx, f_path in enumerate(file_paths, 1):
+        try:
+            await progress_msg.edit_text(
+                build_progress_bar(
+                    current=idx,
+                    total=len(file_paths),
+                    title="Matn tanilmoqda (OCR)...",
+                    current_info=os.path.basename(f_path),
+                    start_time=start_time
+                ),
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+
+        async with CONVERT_SEMAPHORE:
+            recognized_text = await loop.run_in_executor(None, extract_text_ocr, f_path, "uzb+rus+eng")
+
+        clean_name = os.path.basename(f_path)
+        if "_" in clean_name:
+            clean_name = clean_name.split("_", 1)[1]
+
+        # Agar matn ixcham bo'lsa xabar qilib, katta bo'lsa .txt qilib jo'natamiz
+        if len(recognized_text) <= 3500:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"🔍 <b>OCR Natijasi:</b> <code>{clean_name}</code>\n\n{recognized_text}",
+                parse_mode='HTML'
+            )
+        else:
+            txt_path = os.path.join(user_dir, f"ocr_{idx}.txt")
+            with open(txt_path, 'w', encoding='utf-8') as f:
+                f.write(recognized_text)
+            
+            snippet = recognized_text[:500] + "...\n<i>(To'liq matn quyidagi faylda)</i>"
+            with open(txt_path, 'rb') as f:
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=f,
+                    filename=f"OCR_{os.path.splitext(clean_name)[0]}.txt",
+                    caption=f"🔍 <b>OCR Natijasi (Katta hajm):</b>\n\n{snippet}",
+                    parse_mode='HTML'
+                )
+
+        await asyncio.sleep(0.3)
+
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
+
+    cleanup_user_files(user_dir)
+    reset_user_session(user_id)
+
+
+async def video_to_gif_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Videoni animatsiyali GIF ga aylantirish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = query.from_user.id
+    sess = get_user_session(user_id)
+
+    video_items = [it for it in sess['items'] if it['type'] == 'video']
+    if not video_items:
+        await query.message.reply_text("❌ GIF qilish uchun video topilmadi!")
+        return
+
+    sess['menu_msg_id'] = None
+    initial_progress = build_progress_bar(
+        current=0,
+        total=len(video_items),
+        title="Video yuklanmoqda...",
+        current_info="Tayyorlanmoqda..."
+    )
+    try:
+        await query.message.edit_text(initial_progress, parse_mode='HTML')
+        progress_msg = query.message
+    except Exception:
+        progress_msg = await query.message.reply_html(initial_progress)
+    user_dir = get_user_dir(DOCUMENTS_DIR, user_id)
+
+    # 1. Yuklab olish
+    vid_paths = await _download_session_items(context.bot, video_items, user_dir, progress_msg)
+
+    # 2. GIF ga o'tkazish
+    start_time = time.time()
+    loop = asyncio.get_running_loop()
+
+    for idx, v_path in enumerate(vid_paths, 1):
+        try:
+            await progress_msg.edit_text(
+                build_progress_bar(
+                    current=idx,
+                    total=len(vid_paths),
+                    title="GIF animatsiya tayyorlanmoqda...",
+                    current_info=os.path.basename(v_path),
+                    start_time=start_time
+                ),
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+
+        output_gif = os.path.join(user_dir, f"anim_{idx}_{int(time.time())}.gif")
+        async with CONVERT_SEMAPHORE:
+            success = await loop.run_in_executor(None, convert_video_to_gif, v_path, output_gif, 15)
+
+        if success and os.path.exists(output_gif):
+            with open(output_gif, 'rb') as gif_file:
+                await context.bot.send_animation(
+                    chat_id=user_id,
+                    animation=gif_file,
+                    caption="✅ <b>GIF animatsiya tayyor!</b>\n🤖 @convertorai_bot",
+                    parse_mode='HTML',
+                    read_timeout=120.0,
+                    write_timeout=120.0
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ {os.path.basename(v_path)} videoni GIF ga o'girib bo'lmadi."
             )
         await asyncio.sleep(0.3)
 
@@ -1966,8 +2254,11 @@ def main():
     application.add_handler(CallbackQueryHandler(make_pdf_to_images_callback, pattern="^action_pdf_to_images$"))
     application.add_handler(CallbackQueryHandler(merge_pdf_callback, pattern="^action_merge_pdf$"))
     application.add_handler(CallbackQueryHandler(compress_pdf_callback, pattern="^action_compress_pdf$"))
+    application.add_handler(CallbackQueryHandler(office_to_pdf_callback, pattern="^action_office_to_pdf$"))
+    application.add_handler(CallbackQueryHandler(ocr_callback, pattern="^action_ocr$"))
     application.add_handler(CallbackQueryHandler(text_to_pdf_callback, pattern="^action_text_to_pdf$"))
     application.add_handler(CallbackQueryHandler(media_to_mp3_callback, pattern="^action_media_to_mp3$"))
+    application.add_handler(CallbackQueryHandler(video_to_gif_callback, pattern="^action_video_to_gif$"))
     application.add_handler(CallbackQueryHandler(unzip_callback, pattern="^action_unzip$"))
     application.add_handler(CallbackQueryHandler(make_zip_callback, pattern="^action_make_zip$"))
     application.add_handler(CallbackQueryHandler(clear_files_callback, pattern="^action_clear_files$"))

@@ -11,6 +11,28 @@ from PIL import Image, ImageOps
 import pypdfium2 as pdfium
 import pymupdf
 
+# iPhone HEIC/HEIF rasmlarini avtomatik qo'llab-quvvatlash
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except ImportError:
+    pass
+
+# OCR (Matn tanish) Tesseract sozlamalari
+try:
+    import pytesseract
+    _tess_paths = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        "/usr/bin/tesseract"
+    ]
+    for tp in _tess_paths:
+        if os.path.exists(tp):
+            pytesseract.pytesseract.tesseract_cmd = tp
+            break
+except ImportError:
+    pytesseract = None
+
 try:
     import pyzipper
 except ImportError:
@@ -52,6 +74,23 @@ try:
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     FFMPEG_PATH = shutil.which("ffmpeg")
+
+def get_libreoffice_cmd() -> str:
+    """LibreOffice / Soffice dasturini topish"""
+    for cmd in ["libreoffice", "soffice"]:
+        which_p = shutil.which(cmd)
+        if which_p:
+            return which_p
+    win_paths = [
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"
+    ]
+    for p in win_paths:
+        if os.path.exists(p):
+            return p
+    return "libreoffice"
+
+LIBREOFFICE_BIN = get_libreoffice_cmd()
 
 logger = logging.getLogger(__name__)
 
@@ -587,7 +626,7 @@ def extract_archive(archive_path: str, extract_to_dir: str, password: str = None
 
 
 # =========================================================================
-# 3. AUDIO VA VIDEO MEDIA KONVERTATSIYASI (FFMPEG)
+# 3. AUDIO, VIDEO VA GIF MEDIA KONVERTATSIYASI (FFMPEG)
 # =========================================================================
 
 def convert_media_to_mp3(media_path: str, output_mp3_path: str) -> bool:
@@ -612,6 +651,133 @@ def convert_media_to_mp3(media_path: str, output_mp3_path: str) -> bool:
     except Exception as e:
         logger.error(f"Media to MP3 conversion failed: {e}", exc_info=True)
         return False
+    finally:
+        force_garbage_collection()
+
+
+def convert_video_to_gif(video_path: str, output_gif_path: str, max_duration: int = 15) -> bool:
+    """
+    Videodan sifatli va ixcham animatsiyali GIF tayyorlaydi.
+    """
+    if not os.path.exists(video_path) or not FFMPEG_PATH:
+        return False
+    try:
+        # 2-bosqichli yuqori sifatli ranglar palitrasi filtri
+        cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-t", str(max_duration),
+            "-i", video_path,
+            "-vf", "fps=12,scale=480:-1:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer",
+            output_gif_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        return res.returncode == 0 and os.path.exists(output_gif_path)
+    except Exception as e:
+        logger.error(f"Video to GIF conversion failed: {e}", exc_info=True)
+        return False
+    finally:
+        force_garbage_collection()
+
+
+# =========================================================================
+# 4. OFFICE HUJJATLARINI PDF GA AYLANTIRISH (LIBREOFFICE HEADLESS)
+# =========================================================================
+
+def convert_office_to_pdf(office_path: str, output_dir: str) -> Optional[str]:
+    """
+    Word (.docx, .doc), Excel (.xlsx, .xls), PowerPoint (.pptx, .ppt), RTF, ODT fayllarni
+    LibreOffice orqali 100% original ko'rinishida PDF ga o'tkazadi.
+    """
+    if not os.path.exists(office_path):
+        return None
+    try:
+        cmd = [
+            LIBREOFFICE_BIN,
+            "--headless",
+            "--convert-to", "pdf",
+            "--outdir", output_dir,
+            office_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        if res.returncode == 0:
+            base_name = os.path.splitext(os.path.basename(office_path))[0]
+            expected_pdf = os.path.join(output_dir, f"{base_name}.pdf")
+            if os.path.exists(expected_pdf):
+                return expected_pdf
+            # Ba'zida LibreOffice kichik harfda nomlaydi
+            for f in os.listdir(output_dir):
+                if f.lower() == f"{base_name.lower()}.pdf":
+                    return os.path.join(output_dir, f)
+        logger.warning(f"LibreOffice convert warning: {res.stderr.decode('utf-8', errors='ignore')}")
+        return None
+    except Exception as e:
+        logger.error(f"Office to PDF conversion failed ({office_path}): {e}", exc_info=True)
+        return None
+    finally:
+        force_garbage_collection()
+
+
+# =========================================================================
+# 5. OCR MATN TANISH (TESSERACT OCR)
+# =========================================================================
+
+def extract_text_ocr(file_path: str, lang: str = "uzb+rus+eng") -> str:
+    """
+    Rasm yoki PDF faylidagi matnlarni OCR orqali tanib, matn ko'rinishida qaytaradi.
+    Qo'llab-quvvatlaydi: O'zbek, Rus, Ingliz tillari.
+    """
+    if not os.path.exists(file_path) or not pytesseract:
+        return "⚠️ OCR dvigateli o'rnatilmagan yoki fayl topilmadi."
+
+    extracted_texts = []
+    lower_path = file_path.lower()
+    try:
+        # 1. Rasm bo'lsa
+        if lower_path.endswith(('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.heic', '.heif', '.tiff')):
+            with Image.open(file_path) as img:
+                img = ImageOps.exif_transpose(img)
+                # Tillar: mavjud tillarni tekshirish
+                available_langs = pytesseract.get_languages(config='')
+                target_langs = []
+                for l in lang.split('+'):
+                    if l in available_langs:
+                        target_langs.append(l)
+                lang_str = "+".join(target_langs) if target_langs else "eng"
+                
+                txt = pytesseract.image_to_string(img, lang=lang_str)
+                if txt.strip():
+                    extracted_texts.append(txt.strip())
+
+        # 2. PDF bo'lsa
+        elif lower_path.endswith('.pdf'):
+            doc = pymupdf.open(file_path)
+            total_pages = len(doc)
+            available_langs = pytesseract.get_languages(config='')
+            target_langs = [l for l in lang.split('+') if l in available_langs]
+            lang_str = "+".join(target_langs) if target_langs else "eng"
+
+            for page_num in range(total_pages):
+                page = doc[page_num]
+                # To'g'ridan-to'g'ri matn bo'lsa avval uni olamiz
+                raw_txt = page.get_text()
+                if raw_txt.strip():
+                    extracted_texts.append(f"--- [ {page_num + 1}-sahifa ] ---\n{raw_txt.strip()}")
+                else:
+                    # Rasm sifatida render qilib OCR qilamiz
+                    pix = page.get_pixmap(dpi=200)
+                    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    txt = pytesseract.image_to_string(img, lang=lang_str)
+                    if txt.strip():
+                        extracted_texts.append(f"--- [ {page_num + 1}-sahifa (OCR) ] ---\n{txt.strip()}")
+            doc.close()
+
+        if not extracted_texts:
+            return "🔍 Fayldan hech qanday matn topilmadi yoki rasm sifati past."
+        return "\n\n".join(extracted_texts)
+    except Exception as e:
+        logger.error(f"OCR extraction failed ({file_path}): {e}", exc_info=True)
+        return f"⚠️ Matnni ajratishda xatolik yuz berdi: {e}"
     finally:
         force_garbage_collection()
 
