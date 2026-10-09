@@ -14,8 +14,7 @@ from telegram import (
     InlineKeyboardButton,
     InputFile,
     InputMediaPhoto,
-    MenuButtonWebApp,
-    WebAppInfo
+    MenuButtonDefault
 )
 from telegram.error import RetryAfter, BadRequest
 from telegram.warnings import PTBUserWarning
@@ -2274,14 +2273,8 @@ def main():
 
     async def post_init(app):
         try:
-            if WEBAPP_URL:
-                await app.bot.set_chat_menu_button(
-                    menu_button=MenuButtonWebApp(
-                        text="📱 Mini App",
-                        web_app=WebAppInfo(url=WEBAPP_URL)
-                    )
-                )
-                logger.info("✅ Telegram WebApp Menu Button o'rnatildi.")
+            await app.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+            logger.info("✅ Telegram Menu Button standart holatga qaytarildi.")
         except Exception as e:
             logger.warning(f"Menu button set error: {e}")
 
@@ -2330,9 +2323,6 @@ def main():
 
     # Foydalanuvchi fayllarini qabul qilish (Rasm, Hujjat, Video, Audio, Voice)
     application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.VOICE, handle_user_files))
-
-    # Mini App (WebApp) dan kelgan sozlamalarni qabul qilish
-    application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, handle_web_app_data))
 
     # Matnli xabarlarni qabul qilish (Arxiv paroli va boshqalar)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
