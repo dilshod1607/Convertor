@@ -20,6 +20,9 @@ LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "database.db")
 DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "documents")
 
+# Telegram Mini App (WebApp) URL
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://16lyrics.duckdns.org/convertor/")
+
 # Xabarlar
 NOT_SUB_MESSAGE = "Botdan foydalanish uchun quyidagi kanallarga a'zo bo'ling:"
 WELCOME_MESSAGE = (

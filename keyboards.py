@@ -1,4 +1,5 @@
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+from config import WEBAPP_URL
 
 def get_subscription_keyboard(channels: list) -> InlineKeyboardMarkup:
     """Majburiy a'zolik kanallari tugmalari"""
@@ -27,7 +28,9 @@ def get_file_action_keyboard(
     # 1. Rasmlar bo'lsa
     if photo_count > 0:
         buttons.append([InlineKeyboardButton(f"📄 Rasmlarni PDF qilish ({photo_count} ta)", callback_data="action_make_pdf")])
-        buttons.append([InlineKeyboardButton(f"🔍 Matnni ajratib olish (OCR)", callback_data="action_ocr")])
+        if photo_count >= 2:
+            buttons.append([InlineKeyboardButton("📱 Sahifalarni tartiblash (Mini App)", web_app=WebAppInfo(url=WEBAPP_URL))])
+        buttons.append([InlineKeyboardButton("🔍 Matnni ajratib olish (OCR)", callback_data="action_ocr")])
 
     # 2. Office hujjatlari (Word, Excel, PowerPoint) bo'lsa
     if office_count > 0:
@@ -36,6 +39,7 @@ def get_file_action_keyboard(
     # 3. PDF fayllar bo'lsa
     if pdf_count >= 2:
         buttons.append([InlineKeyboardButton(f"📑 PDF larni birlashtirish ({pdf_count} ta)", callback_data="action_merge_pdf")])
+        buttons.append([InlineKeyboardButton("📱 Sahifalarni tartiblash (Mini App)", web_app=WebAppInfo(url=WEBAPP_URL))])
         buttons.append([
             InlineKeyboardButton("🖼 Rasmlarga ajratish", callback_data="action_pdf_to_images"),
             InlineKeyboardButton("🗜 Siqish (Compress)", callback_data="action_compress_pdf")
@@ -45,6 +49,7 @@ def get_file_action_keyboard(
             InlineKeyboardButton("🖼 Rasmlarga ajratish", callback_data="action_pdf_to_images"),
             InlineKeyboardButton("🗜 Siqish (Compress)", callback_data="action_compress_pdf")
         ])
+        buttons.append([InlineKeyboardButton("📱 Sahifalarni tartiblash (Mini App)", web_app=WebAppInfo(url=WEBAPP_URL))])
         buttons.append([InlineKeyboardButton("🔍 Matnni ajratib olish (OCR)", callback_data="action_ocr")])
 
     # 4. Audio / Video media bo'lsa
