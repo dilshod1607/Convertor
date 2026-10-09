@@ -1,15 +1,25 @@
 import os
+import sys
 import time
 import zipfile
+import tarfile
 import shutil
 import logging
+import subprocess
+import gc
 from PIL import Image, ImageOps
 import pypdfium2 as pdfium
+import pymupdf
 
 try:
     import pyzipper
 except ImportError:
     pyzipper = None
+
+try:
+    import py7zr
+except ImportError:
+    py7zr = None
 
 try:
     import rarfile
@@ -37,6 +47,12 @@ try:
 except ImportError:
     rarfile = None
 
+try:
+    import imageio_ffmpeg
+    FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_PATH = shutil.which("ffmpeg")
+
 logger = logging.getLogger(__name__)
 
 
@@ -57,12 +73,21 @@ def get_user_dir(base_dir: str, user_id: int) -> str:
     return user_path
 
 
+def force_garbage_collection():
+    """Xotirani majburiy bo'shatish"""
+    try:
+        gc.collect()
+    except Exception:
+        pass
+
+
 def is_archive_encrypted(archive_path: str) -> bool:
     """Arxiv fayl parol bilan himoyalanganligini aniqlash"""
     if not os.path.exists(archive_path):
         return False
     lower_path = archive_path.lower()
     try:
+        # 1. ZIP
         zip_module = pyzipper if pyzipper else zipfile
         if lower_path.endswith('.zip') or zip_module.is_zipfile(archive_path):
             if pyzipper:
@@ -71,6 +96,14 @@ def is_archive_encrypted(archive_path: str) -> bool:
             else:
                 with zipfile.ZipFile(archive_path, 'r') as zipf:
                     return any(bool(m.flag_bits & 0x1) for m in zipf.infolist())
+
+        # 2. 7Z
+        elif lower_path.endswith('.7z') and py7zr:
+            if py7zr.is_7zfile(archive_path):
+                with py7zr.SevenZipFile(archive_path, mode='r') as sz:
+                    return sz.needs_password()
+
+        # 3. RAR
         elif lower_path.endswith('.rar') and rarfile:
             if rarfile.is_rarfile(archive_path):
                 try:
@@ -86,6 +119,10 @@ def is_archive_encrypted(archive_path: str) -> bool:
         logger.warning(f"Arxiv shifrlanganligini tekshirishda ogohlantirish: {e}")
     return False
 
+
+# =========================================================================
+# 1. RASMLAR VA PDF KONVERTATSIYALARI
+# =========================================================================
 
 def convert_images_to_pdf(image_paths: list[str], output_pdf_path: str, progress_callback=None) -> bool:
     """
@@ -130,7 +167,7 @@ def convert_images_to_pdf(image_paths: list[str], output_pdf_path: str, progress
             resolution=100.0,
             save_all=True,
             append_images=other_imgs,
-            quality=95
+            quality=92
         )
         return True
     except Exception as e:
@@ -142,6 +179,7 @@ def convert_images_to_pdf(image_paths: list[str], output_pdf_path: str, progress
                 im.close()
             except Exception:
                 pass
+        force_garbage_collection()
 
 
 def convert_pdf_to_images(pdf_paths: list[str], output_dir: str, scale: float = 2.0, progress_callback=None) -> list[str]:
@@ -188,7 +226,137 @@ def convert_pdf_to_images(pdf_paths: list[str], output_dir: str, scale: float = 
     except Exception as e:
         logger.error(f"PDF to Images conversion failed: {e}", exc_info=True)
         return created_images
+    finally:
+        force_garbage_collection()
 
+
+def merge_pdf_files(pdf_paths: list[str], output_pdf_path: str, progress_callback=None) -> bool:
+    """
+    Bir nechta PDF fayllarini bitta yaxlit PDF faylga birlashtiradi.
+    """
+    if not pdf_paths or len(pdf_paths) < 2:
+        return False
+
+    merged_doc = pymupdf.open()
+    total = len(pdf_paths)
+    try:
+        for idx, p_path in enumerate(pdf_paths, 1):
+            if os.path.exists(p_path):
+                with pymupdf.open(p_path) as src_doc:
+                    merged_doc.insert_pdf(src_doc)
+            if progress_callback:
+                try:
+                    progress_callback(idx, total, os.path.basename(p_path))
+                except Exception:
+                    pass
+
+        merged_doc.save(output_pdf_path, deflate=True, garbage=4)
+        return True
+    except Exception as e:
+        logger.error(f"PDF merge failed: {e}", exc_info=True)
+        return False
+    finally:
+        merged_doc.close()
+        force_garbage_collection()
+
+
+def compress_pdf(pdf_path: str, output_pdf_path: str) -> tuple[bool, int, int]:
+    """
+    PDF faylining hajmini sifatini saqlagan holda siqadi (Compress).
+    Qaytaradi: (success: bool, original_size: int, compressed_size: int)
+    """
+    if not os.path.exists(pdf_path):
+        return False, 0, 0
+
+    orig_size = os.path.getsize(pdf_path)
+    try:
+        doc = pymupdf.open(pdf_path)
+        doc.save(
+            output_pdf_path,
+            deflate=True,
+            deflate_images=True,
+            deflate_fonts=True,
+            garbage=4,
+            clean=True
+        )
+        doc.close()
+        new_size = os.path.getsize(output_pdf_path)
+        return True, orig_size, new_size
+    except Exception as e:
+        logger.error(f"PDF compression failed: {e}", exc_info=True)
+        return False, orig_size, orig_size
+    finally:
+        force_garbage_collection()
+
+
+def encrypt_pdf(pdf_path: str, output_pdf_path: str, password: str) -> bool:
+    """
+    PDF fayliga xavfsiz AES-256 parol qo'yadi.
+    """
+    if not os.path.exists(pdf_path) or not password:
+        return False
+    try:
+        doc = pymupdf.open(pdf_path)
+        doc.save(
+            output_pdf_path,
+            encryption=pymupdf.PDF_ENCRYPT_AES_256,
+            user_pw=password,
+            owner_pw=password,
+            deflate=True
+        )
+        doc.close()
+        return True
+    except Exception as e:
+        logger.error(f"PDF encryption failed: {e}", exc_info=True)
+        return False
+    finally:
+        force_garbage_collection()
+
+
+def convert_text_to_pdf(text_file_path: str, output_pdf_path: str) -> bool:
+    """
+    Matnli fayl (.txt, .md, .py, .log, .json, .csv) ni formatlangan PDF ga aylantiradi.
+    """
+    if not os.path.exists(text_file_path):
+        return False
+    try:
+        with open(text_file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+
+        doc = pymupdf.open()
+        margin = 40
+        page_width, page_height = 595, 842  # A4 o'lchami
+        fontsize = 10
+        line_height = 14
+        lines_per_page = int((page_height - 2 * margin) / line_height)
+
+        curr_line = 0
+        while curr_line < len(lines):
+            page = doc.new_page(width=page_width, height=page_height)
+            y = margin
+            chunk = lines[curr_line:curr_line + lines_per_page]
+            for l in chunk:
+                clean_l = l.rstrip('\r\n')
+                # 90 belgidan oshsa qirqish
+                if len(clean_l) > 95:
+                    clean_l = clean_l[:92] + "..."
+                page.insert_text((margin, y), clean_l, fontsize=fontsize)
+                y += line_height
+            curr_line += lines_per_page
+
+        doc.save(output_pdf_path, deflate=True)
+        doc.close()
+        return True
+    except Exception as e:
+        logger.error(f"Text to PDF conversion failed: {e}", exc_info=True)
+        return False
+    finally:
+        force_garbage_collection()
+
+
+# =========================================================================
+# 2. UNIVERSAL ARXIVLAR (ZIP, RAR, 7Z, TAR, GZ, BZ2, XZ)
+# =========================================================================
 
 def create_zip_archive(file_paths: list[str], output_zip_path: str, progress_callback=None) -> bool:
     """
@@ -217,9 +385,29 @@ def create_zip_archive(file_paths: list[str], output_zip_path: str, progress_cal
         return False
 
 
+def create_7z_archive(file_paths: list[str], output_7z_path: str, password: str = None) -> bool:
+    """
+    Berilgan fayllarni 7Z formatida arxivlaydi (ixtiyoriy AES-256 parol bilan).
+    """
+    if not file_paths or not py7zr:
+        return False
+    try:
+        with py7zr.SevenZipFile(output_7z_path, 'w', password=password) as archive:
+            for f_path in file_paths:
+                if os.path.exists(f_path):
+                    arcname = os.path.basename(f_path)
+                    if "_" in arcname and not arcname.startswith("page_"):
+                        arcname = arcname.split("_", 1)[1]
+                    archive.write(f_path, arcname=arcname)
+        return True
+    except Exception as e:
+        logger.error(f"7Z creation failed: {e}", exc_info=True)
+        return False
+
+
 def extract_archive(archive_path: str, extract_to_dir: str, password: str = None) -> list[dict]:
     """
-    ZIP yoki RAR arxivdagi barcha fayllarni papka tuzilmasini saqlagan holda xavfsiz chiqaradi.
+    ZIP, RAR, 7Z, TAR, GZ, BZ2, XZ arxivdagi barcha fayllarni papka tuzilmasini saqlagan holda xavfsiz chiqaradi.
     Agar arxiv parol bilan himoyalangan bo'lsa va parol berilmagan bo'lsa ArchivePasswordRequired ko'taradi.
     Agar kiritilgan parol noto'g'ri bo'lsa ArchiveWrongPassword ko'taradi.
     Qaytaradi: [{'full_path': '...', 'rel_dir': '...', 'file_name': '...', 'rel_path': '...'}, ...]
@@ -233,8 +421,66 @@ def extract_archive(archive_path: str, extract_to_dir: str, password: str = None
     zip_module = pyzipper if pyzipper else zipfile
 
     try:
-        # 1. ZIP Fayl bo'lsa
-        if lower_path.endswith('.zip') or zip_module.is_zipfile(archive_path):
+        # 1. 7Z Arxiv bo'lsa
+        if lower_path.endswith('.7z') and py7zr:
+            try:
+                with py7zr.SevenZipFile(archive_path, mode='r', password=password) as sz:
+                    if sz.needs_password() and not password:
+                        raise ArchivePasswordRequired("Ushbu 7Z arxiv parol bilan himoyalangan!")
+                    
+                    sz.extractall(path=extract_to_dir)
+                    for root, dirs, files in os.walk(extract_to_dir):
+                        for f in files:
+                            full_p = os.path.join(root, f)
+                            rel_d = os.path.relpath(root, extract_to_dir).replace('\\', '/')
+                            if rel_d == ".":
+                                rel_d = "Asosiy papka"
+                            extracted_items.append({
+                                'full_path': full_p,
+                                'rel_dir': rel_d,
+                                'file_name': f,
+                                'rel_path': os.path.relpath(full_p, extract_to_dir).replace('\\', '/')
+                            })
+                return extracted_items
+            except py7zr.exceptions.PasswordRequired:
+                raise ArchivePasswordRequired("Parol talab qilinadi!")
+            except py7zr.exceptions.Bad7zFile as b7:
+                if password:
+                    raise ArchiveWrongPassword("Kiritilgan parol noto'g'ri!")
+                raise b7
+
+        # 2. TAR, GZ, BZ2, XZ Arxiv bo'lsa
+        elif lower_path.endswith(('.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz')):
+            mode = "r:*"
+            with tarfile.open(archive_path, mode) as tar:
+                for member in tar.getmembers():
+                    if member.isdir():
+                        continue
+                    # Path traversal xavfsizligi
+                    clean_name = os.path.normpath(member.name).replace('\\', '/')
+                    parts = [p for p in clean_name.split('/') if p and p not in ('.', '..')]
+                    if not parts:
+                        continue
+                    
+                    rel_dir = "/".join(parts[:-1]) if len(parts) > 1 else ""
+                    file_name = parts[-1]
+                    target_dir = os.path.join(extract_to_dir, *parts[:-1]) if rel_dir else extract_to_dir
+                    os.makedirs(target_dir, exist_ok=True)
+                    
+                    target_path = os.path.join(target_dir, file_name)
+                    tar.extract(member, path=extract_to_dir)
+                    
+                    if os.path.exists(target_path):
+                        extracted_items.append({
+                            'full_path': target_path,
+                            'rel_dir': rel_dir if rel_dir else "Asosiy papka",
+                            'file_name': file_name,
+                            'rel_path': clean_name
+                        })
+            return extracted_items
+
+        # 3. ZIP Fayl bo'lsa
+        elif lower_path.endswith('.zip') or zip_module.is_zipfile(archive_path):
             ZipCls = pyzipper.AESZipFile if pyzipper else zipfile.ZipFile
             with ZipCls(archive_path, 'r') as zipf:
                 if pwd_bytes:
@@ -248,7 +494,6 @@ def extract_archive(archive_path: str, extract_to_dir: str, password: str = None
                 for member in zipf.infolist():
                     if member.is_dir():
                         continue
-                    # Xavfsiz nisbiy yo'l
                     raw_filename = member.filename.replace('\\', '/')
                     parts = [p for p in raw_filename.split('/') if p and p not in ('.', '..')]
                     if not parts:
@@ -284,7 +529,7 @@ def extract_archive(archive_path: str, extract_to_dir: str, password: str = None
                         'rel_path': raw_filename
                     })
 
-        # 2. RAR Fayl bo'lsa
+        # 4. RAR Fayl bo'lsa
         elif lower_path.endswith('.rar') and rarfile:
             with rarfile.RarFile(archive_path, 'r') as rarf:
                 if password:
@@ -337,6 +582,43 @@ def extract_archive(archive_path: str, extract_to_dir: str, password: str = None
     except Exception as e:
         logger.error(f"Archive extraction failed ({archive_path}): {e}", exc_info=True)
         raise e
+    finally:
+        force_garbage_collection()
+
+
+# =========================================================================
+# 3. AUDIO VA VIDEO MEDIA KONVERTATSIYASI (FFMPEG)
+# =========================================================================
+
+def convert_media_to_mp3(media_path: str, output_mp3_path: str) -> bool:
+    """
+    Video yoki audio faylni yuqori sifatli 192kbps MP3 formatiga o'tkazadi.
+    """
+    if not os.path.exists(media_path) or not FFMPEG_PATH:
+        return False
+    try:
+        cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-i", media_path,
+            "-vn",
+            "-acodec", "libmp3lame",
+            "-ab", "192k",
+            "-ar", "44100",
+            output_mp3_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        return res.returncode == 0 and os.path.exists(output_mp3_path)
+    except Exception as e:
+        logger.error(f"Media to MP3 conversion failed: {e}", exc_info=True)
+        return False
+    finally:
+        force_garbage_collection()
+
+
+# =========================================================================
+# 4. TOZALASH VA XOTIRA NAZORATI
+# =========================================================================
 
 def cleanup_user_files(user_folder: str):
     """Foydalanuvchi papkasidagi barcha vaqtinchalik fayllarni tozalash"""
@@ -346,9 +628,12 @@ def cleanup_user_files(user_folder: str):
             os.makedirs(user_folder, exist_ok=True)
     except Exception as e:
         logger.error(f"Error cleaning user folder {user_folder}: {e}")
+    finally:
+        force_garbage_collection()
 
-def cleanup_old_files(base_dir: str, max_age_seconds: int = 3600):
-    """1 soatdan ortiq saqlanib qolgan eski fayllarni tozalash"""
+
+def cleanup_old_files(base_dir: str, max_age_seconds: int = 1800):
+    """30 daqiqadan ortiq saqlanib qolgan eski fayllarni tozalash"""
     if not os.path.exists(base_dir):
         return
     now = time.time()
@@ -363,3 +648,5 @@ def cleanup_old_files(base_dir: str, max_age_seconds: int = 3600):
                     pass
     except Exception as e:
         logger.error(f"Error during scheduled cleanup: {e}")
+    finally:
+        force_garbage_collection()

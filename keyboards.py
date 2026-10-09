@@ -11,27 +11,49 @@ def get_subscription_keyboard(channels: list) -> InlineKeyboardMarkup:
     keyboard.append([InlineKeyboardButton("🔄 A'zolikni tekshirish", callback_data="check_subscription")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_file_action_keyboard(photo_count: int, doc_count: int, pdf_count: int = 0, zip_count: int = 0) -> InlineKeyboardMarkup:
-    """Fayllar yuklangandan keyingi harakatlar menyusi"""
+def get_file_action_keyboard(
+    photo_count: int = 0,
+    doc_count: int = 0,
+    pdf_count: int = 0,
+    archive_count: int = 0,
+    media_count: int = 0,
+    text_count: int = 0
+) -> InlineKeyboardMarkup:
+    """Fayllar yuklangandan keyingi aqlli moslashuvchan harakatlar menyusi"""
     buttons = []
     
-    # 1. Rasmlar bo'lsa -> PDF qilish tugmasi
+    # 1. Rasmlar bo'lsa -> PDF qilish
     if photo_count > 0:
-        buttons.append([InlineKeyboardButton(f"📄 Rasmlarni PDF qilish ({photo_count} ta rasm)", callback_data="action_make_pdf")])
+        buttons.append([InlineKeyboardButton(f"📄 Rasmlarni PDF qilish ({photo_count} ta)", callback_data="action_make_pdf")])
         
-    # 2. PDF fayl bo'lsa -> Rasmlarga ajratish (PDF to Image) tugmasi
-    if pdf_count > 0:
-        buttons.append([InlineKeyboardButton(f"🖼 PDFni Rasmlarga ajratish ({pdf_count} ta PDF)", callback_data="action_pdf_to_images")])
+    # 2. PDF fayllar bo'lsa
+    if pdf_count >= 2:
+        buttons.append([InlineKeyboardButton(f"📑 PDF larni birlashtirish ({pdf_count} ta)", callback_data="action_merge_pdf")])
+        buttons.append([
+            InlineKeyboardButton("🖼 Rasmlarga ajratish", callback_data="action_pdf_to_images"),
+            InlineKeyboardButton("🗜 Siqish (Compress)", callback_data="action_compress_pdf")
+        ])
+    elif pdf_count == 1:
+        buttons.append([InlineKeyboardButton("🖼 PDF ni Rasmlarga ajratish", callback_data="action_pdf_to_images")])
+        buttons.append([InlineKeyboardButton("🗜 PDF ni siqish (Compress)", callback_data="action_compress_pdf")])
 
-    # 3. ZIP fayl bo'lsa -> Arxivdan chiqarish (Unzip) tugmasi
-    if zip_count > 0:
-        buttons.append([InlineKeyboardButton(f"📂 ZIP arxivni ochish ({zip_count} ta ZIP)", callback_data="action_unzip")])
+    # 3. Audio / Video media bo'lsa -> MP3 ga o'tkazish
+    if media_count > 0:
+        buttons.append([InlineKeyboardButton(f"🎵 MP3 ga aylantirish ({media_count} ta)", callback_data="action_media_to_mp3")])
 
-    # 4. Fayllar mavjud bo'lsa -> ZIP arxivlash va tozalash
-    total = photo_count + doc_count + pdf_count + zip_count
+    # 4. Matn / Kod fayllari bo'lsa -> PDF ga o'tkazish
+    if text_count > 0:
+        buttons.append([InlineKeyboardButton(f"📄 Matnni PDF ga o'tkazish ({text_count} ta)", callback_data="action_text_to_pdf")])
+
+    # 5. Arxiv bo'lsa -> Arxivni ochish
+    if archive_count > 0:
+        buttons.append([InlineKeyboardButton(f"📂 Arxivni ochish ({archive_count} ta)", callback_data="action_unzip")])
+
+    # 6. Umumiy fayllar bo'lsa -> ZIP qilish va Tozalash
+    total = photo_count + doc_count + pdf_count + archive_count + media_count + text_count
     if total > 0:
-        if photo_count > 0 or doc_count > 0 or pdf_count > 0:
-            buttons.append([InlineKeyboardButton(f"🗜 Barchasini ZIP qilish ({total} ta fayl)", callback_data="action_make_zip")])
+        if photo_count > 0 or doc_count > 0 or pdf_count > 0 or media_count > 0 or text_count > 0:
+            buttons.append([InlineKeyboardButton(f"🗜 Barchasini ZIP qilish ({total} ta)", callback_data="action_make_zip")])
         buttons.append([InlineKeyboardButton("🗑 Barchasini tozalash", callback_data="action_clear_files")])
 
     return InlineKeyboardMarkup(buttons)
