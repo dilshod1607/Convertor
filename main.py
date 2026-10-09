@@ -13,7 +13,9 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     InputFile,
-    InputMediaPhoto
+    InputMediaPhoto,
+    MenuButtonWebApp,
+    WebAppInfo
 )
 from telegram.error import RetryAfter, BadRequest
 from telegram.warnings import PTBUserWarning
@@ -39,7 +41,8 @@ from config import (
     DATABASE_PATH,
     DOCUMENTS_DIR,
     WELCOME_MESSAGE,
-    NOT_SUB_MESSAGE
+    NOT_SUB_MESSAGE,
+    WEBAPP_URL
 )
 from data import Database
 from converter import (
@@ -2269,11 +2272,25 @@ def main():
         pool_timeout=5.0
     )
 
+    async def post_init(app):
+        try:
+            if WEBAPP_URL:
+                await app.bot.set_chat_menu_button(
+                    menu_button=MenuButtonWebApp(
+                        text="📱 Mini App",
+                        web_app=WebAppInfo(url=WEBAPP_URL)
+                    )
+                )
+                logger.info("✅ Telegram WebApp Menu Button o'rnatildi.")
+        except Exception as e:
+            logger.warning(f"Menu button set error: {e}")
+
     application = (
         ApplicationBuilder()
         .token(API_TOKEN)
         .request(req)
         .concurrent_updates(True)
+        .post_init(post_init)
         .build()
     )
 
