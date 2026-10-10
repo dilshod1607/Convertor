@@ -40,8 +40,7 @@ from config import (
     DATABASE_PATH,
     DOCUMENTS_DIR,
     WELCOME_MESSAGE,
-    NOT_SUB_MESSAGE,
-    WEBAPP_URL
+    NOT_SUB_MESSAGE
 )
 from data import Database
 from converter import (
