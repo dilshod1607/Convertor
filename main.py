@@ -412,11 +412,11 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'file_size': photo.file_size or 0
             })
 
-    # 2. Video yuborilgan bo'lsa
-    elif message.video:
-        vid = message.video
+    # 2. Video yoki Animatsiya yuborilgan bo'lsa
+    elif message.video or message.animation:
+        vid = message.video or message.animation
         if not any(it['file_unique_id'] == vid.file_unique_id for it in sess['items']):
-            safe_name = vid.file_name or f"video_{vid.file_unique_id}.mp4"
+            safe_name = getattr(vid, 'file_name', None) or f"video_{vid.file_unique_id}.mp4"
             sess['items'].append({
                 'type': 'video',
                 'file_id': vid.file_id,
@@ -590,7 +590,7 @@ async def make_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 document=pdf_file,
                 filename=f"Convertor_{len(image_paths)}_rasm.pdf",
-                caption=f"✅ <b>Sizning PDF hujjatingiz tayyor bo'ldi!</b>\n\n📄 <b>Jami sahifalar:</b> {len(image_paths)} ta\n🤖 @convertorai_bot",
+                caption=f"✅ <b>Sizning PDF hujjatingiz tayyor bo'ldi!</b>\n\n📄 <b>Jami sahifalar:</b> {len(image_paths)} ta\n🤖 @convertoral_bot",
                 parse_mode='HTML',
                 read_timeout=120.0,
                 write_timeout=120.0
@@ -789,7 +789,7 @@ async def merge_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"✅ <b>PDF fayllar muvaffaqiyatli birlashtirildi!</b>\n\n"
                     f"📑 <b>Birlashtirilgan hujjatlar:</b> {len(pdf_paths)} ta\n"
                     f"💾 <b>Hajmi:</b> {format_file_size(file_size)}\n"
-                    f"🤖 @convertorai_bot"
+                    f"🤖 @convertoral_bot"
                 ),
                 parse_mode='HTML',
                 read_timeout=120.0,
@@ -882,7 +882,7 @@ async def compress_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TY
                         f"📊 <b>Oldingi hajm:</b> {format_file_size(orig_sz)}\n"
                         f"⚡️ <b>Yangi hajm:</b> {format_file_size(new_sz)}\n"
                         f"📉 <b>Tejaldi:</b> {saved_pct}%\n\n"
-                        f"🤖 @convertorai_bot"
+                        f"🤖 @convertoral_bot"
                     ),
                     parse_mode='HTML',
                     read_timeout=120.0,
@@ -973,7 +973,7 @@ async def text_to_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     caption=(
                         f"✅ <b>Matn PDF formatiga o'tkazildi!</b>\n\n"
                         f"📄 <b>Fayl:</b> <code>{clean_name}</code>\n"
-                        f"🤖 @convertorai_bot"
+                        f"🤖 @convertoral_bot"
                     ),
                     parse_mode='HTML',
                     read_timeout=120.0,
@@ -1000,7 +1000,7 @@ async def media_to_mp3_callback(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     sess = get_user_session(user_id)
 
-    media_items = [it for it in sess['items'] if it['type'] == 'media']
+    media_items = [it for it in sess['items'] if it['type'] in ('media', 'video', 'audio')]
     if not media_items:
         await query.message.reply_text("❌ Audio yoki video fayl topilmadi!")
         return
@@ -1021,19 +1021,26 @@ async def media_to_mp3_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 1. Yuklab olish
     media_paths = await _download_session_items(context.bot, media_items, user_dir, progress_msg)
+    if not media_paths:
+        await progress_msg.edit_text("❌ Fayllarni yuklab olishda xatolik yuz berdi.")
+        cleanup_user_files(user_dir)
+        reset_user_session(user_id)
+        return
 
     # 2. MP3 ga o'tkazish
     start_time = time.time()
     loop = asyncio.get_running_loop()
+    bot_username = context.bot.username or "convertoral_bot"
 
-    for idx, m_path in enumerate(media_paths, 1):
+    for idx, (it, m_path) in enumerate(zip(media_items, media_paths), 1):
+        orig_name = it.get('file_name') or os.path.basename(m_path)
         try:
             await progress_msg.edit_text(
                 build_progress_bar(
                     current=idx,
                     total=len(media_paths),
                     title="Audio/Video MP3 ga o'girilmoqda...",
-                    current_info=os.path.basename(m_path),
+                    current_info=orig_name,
                     start_time=start_time
                 ),
                 parse_mode='HTML'
@@ -1045,25 +1052,27 @@ async def media_to_mp3_callback(update: Update, context: ContextTypes.DEFAULT_TY
         async with CONVERT_SEMAPHORE:
             success = await loop.run_in_executor(None, convert_media_to_mp3, m_path, output_mp3)
 
-        if success and os.path.exists(output_mp3):
-            clean_name = os.path.basename(m_path)
-            if "_" in clean_name:
+        if success and os.path.exists(output_mp3) and os.path.getsize(output_mp3) > 0:
+            clean_name = orig_name
+            if "_" in clean_name and not it.get('file_name'):
                 clean_name = clean_name.split("_", 1)[1]
             base_title = os.path.splitext(clean_name)[0]
+            if not base_title:
+                base_title = f"audio_{idx}"
 
             with open(output_mp3, 'rb') as audio_file:
                 await context.bot.send_audio(
                     chat_id=user_id,
                     audio=audio_file,
                     title=base_title,
-                    performer="@convertorai_bot",
+                    performer=f"@{bot_username}",
                     filename=f"{base_title}.mp3",
                     caption=(
                         f"✅ <b>MP3 audio muvaffaqiyatli tayyorlandi!</b>\n\n"
                         f"🎵 <b>Nomi:</b> <code>{base_title}.mp3</code>\n"
                         f"💾 <b>Hajmi:</b> {format_file_size(os.path.getsize(output_mp3))}\n"
                         f"🎧 <b>Sifat:</b> 192 kbps HD Audio\n"
-                        f"🤖 @convertorai_bot"
+                        f"🤖 @{bot_username}"
                     ),
                     parse_mode='HTML',
                     read_timeout=120.0,
@@ -1072,7 +1081,8 @@ async def media_to_mp3_callback(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"⚠️ {os.path.basename(m_path)} faylini MP3 ga o'girib bo'lmadi."
+                text=f"⚠️ <b>{orig_name}</b> faylidan audio ajratib bo'lmadi (ehtimol videoda audio/ovoz yo'q yoki format qo'llab-quvvatlanmaydi).",
+                parse_mode='HTML'
             )
         await asyncio.sleep(0.3)
 
@@ -1154,7 +1164,7 @@ async def office_to_pdf_callback(update: Update, context: ContextTypes.DEFAULT_T
                         f"✅ <b>Office hujjati PDF ga muvaffaqiyatli o'girildi!</b>\n\n"
                         f"📄 <b>Asl fayl:</b> <code>{clean_name}</code>\n"
                         f"💾 <b>Hajmi:</b> {format_file_size(os.path.getsize(res_pdf))}\n"
-                        f"🤖 @convertorai_bot"
+                        f"🤖 @convertoral_bot"
                     ),
                     parse_mode='HTML',
                     read_timeout=120.0,
@@ -1298,19 +1308,26 @@ async def video_to_gif_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 1. Yuklab olish
     vid_paths = await _download_session_items(context.bot, video_items, user_dir, progress_msg)
+    if not vid_paths:
+        await progress_msg.edit_text("❌ Videoni yuklab olishda xatolik yuz berdi.")
+        cleanup_user_files(user_dir)
+        reset_user_session(user_id)
+        return
 
     # 2. GIF ga o'tkazish
     start_time = time.time()
     loop = asyncio.get_running_loop()
+    bot_username = context.bot.username or "convertoral_bot"
 
-    for idx, v_path in enumerate(vid_paths, 1):
+    for idx, (it, v_path) in enumerate(zip(video_items, vid_paths), 1):
+        orig_name = it.get('file_name') or os.path.basename(v_path)
         try:
             await progress_msg.edit_text(
                 build_progress_bar(
                     current=idx,
                     total=len(vid_paths),
                     title="GIF animatsiya tayyorlanmoqda...",
-                    current_info=os.path.basename(v_path),
+                    current_info=orig_name,
                     start_time=start_time
                 ),
                 parse_mode='HTML'
@@ -1322,12 +1339,12 @@ async def video_to_gif_callback(update: Update, context: ContextTypes.DEFAULT_TY
         async with CONVERT_SEMAPHORE:
             success = await loop.run_in_executor(None, convert_video_to_gif, v_path, output_gif, 15)
 
-        if success and os.path.exists(output_gif):
+        if success and os.path.exists(output_gif) and os.path.getsize(output_gif) > 0:
             with open(output_gif, 'rb') as gif_file:
                 await context.bot.send_animation(
                     chat_id=user_id,
                     animation=gif_file,
-                    caption="✅ <b>GIF animatsiya tayyor!</b>\n🤖 @convertorai_bot",
+                    caption=f"✅ <b>GIF animatsiya tayyor!</b>\n🤖 @{bot_username}",
                     parse_mode='HTML',
                     read_timeout=120.0,
                     write_timeout=120.0
@@ -1335,7 +1352,8 @@ async def video_to_gif_callback(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"⚠️ {os.path.basename(v_path)} videoni GIF ga o'girib bo'lmadi."
+                text=f"⚠️ <b>{orig_name}</b> videoni GIF ga o'girib bo'lmadi.",
+                parse_mode='HTML'
             )
         await asyncio.sleep(0.3)
 
@@ -1734,7 +1752,7 @@ async def make_zip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 document=zip_file,
                 filename=f"Archive_{int(time.time())}.zip",
-                caption=f"✅ <b>Barcha fayllar ZIP arxiviga muvaffaqiyatli jamlandi!</b>\n\n📦 <b>Jami fayllar:</b> {len(downloaded_paths)} ta\n🤖 @convertorai_bot",
+                caption=f"✅ <b>Barcha fayllar ZIP arxiviga muvaffaqiyatli jamlandi!</b>\n\n📦 <b>Jami fayllar:</b> {len(downloaded_paths)} ta\n🤖 @convertoral_bot",
                 parse_mode='HTML',
                 read_timeout=120.0,
                 write_timeout=120.0
@@ -2119,74 +2137,6 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def handle_web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram Mini App (WebApp) dan kelgan ma'lumotlarni qabul qilib, moslashtirilgan PDF yaratish"""
-    message = update.effective_message
-    if not message or not message.web_app_data:
-        return
-
-    user_id = update.effective_user.id
-    raw_data = message.web_app_data.data
-    sess = get_user_session(user_id)
-
-    try:
-        config = json.loads(raw_data)
-    except Exception:
-        await message.reply_html("❌ <b>Mini App ma'lumotlarini o'qishda xatolik yuz berdi.</b>")
-        return
-
-    pages_config = config.get('pages', [])
-    settings = config.get('settings', {})
-    photo_items = [it for it in sess['items'] if it['type'] == 'photo']
-
-    if not photo_items:
-        await message.reply_html("❌ Siz hali birorta ham rasm yubormagansiz!")
-        return
-
-    status_msg = await message.reply_html("⚙️ <b>Mini App buyurtmasi asosida PDF yaratilmoqda...</b>")
-    user_dir = get_user_dir(DOCUMENTS_DIR, user_id)
-
-    # 1. Rasmlarni yuklab olish
-    image_paths = await _download_session_items(context.bot, photo_items, user_dir, status_msg)
-    
-    # 2. Ordered items tuzish
-    ordered_items = []
-    for idx, p_path in enumerate(image_paths):
-        rot = 0
-        if idx < len(pages_config):
-            rot = pages_config[idx].get('rotation', 0)
-        ordered_items.append({'path': p_path, 'rotation': rot})
-
-    output_pdf = os.path.join(user_dir, f"custom_{user_id}_{int(time.time())}.pdf")
-    loop = asyncio.get_running_loop()
-    async with CONVERT_SEMAPHORE:
-        success = await loop.run_in_executor(None, create_custom_pdf, ordered_items, output_pdf, settings)
-
-    if success and os.path.exists(output_pdf):
-        with open(output_pdf, 'rb') as f:
-            await context.bot.send_document(
-                chat_id=user_id,
-                document=f,
-                filename=f"Convertor_Custom_{len(ordered_items)}_sahifa.pdf",
-                caption=(
-                    f"✅ <b>Sizning Mini App orqali sozlangan PDF hujjatingiz tayyor!</b>\n\n"
-                    f"📄 <b>Sahifalar:</b> {len(ordered_items)} ta\n"
-                    f"💾 <b>Hajmi:</b> {format_file_size(os.path.getsize(output_pdf))}\n"
-                    f"🤖 @convertorai_bot"
-                ),
-                parse_mode='HTML'
-            )
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
-    else:
-        await status_msg.edit_text("❌ PDF yaratishda xatolik yuz berdi.")
-
-    cleanup_user_files(user_dir)
-    reset_user_session(user_id)
-
-
 # =========================================================================
 # ADMIN KANAL QO'SHISH CONVERSATION
 # =========================================================================
@@ -2320,8 +2270,8 @@ def main():
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("cancel", cancel_command))
 
-    # Foydalanuvchi fayllarini qabul qilish (Rasm, Hujjat, Video, Audio, Voice)
-    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.VOICE, handle_user_files))
+    # Foydalanuvchi fayllarini qabul qilish (Rasm, Hujjat, Video, Audio, Voice, Animatsiya)
+    application.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.ANIMATION, handle_user_files))
 
     # Matnli xabarlarni qabul qilish (Arxiv paroli va boshqalar)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))

@@ -716,7 +716,11 @@ def convert_media_to_mp3(media_path: str, output_mp3_path: str) -> bool:
             output_mp3_path
         ]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-        return res.returncode == 0 and os.path.exists(output_mp3_path)
+        if res.returncode != 0:
+            err = res.stderr.decode('utf-8', errors='ignore')
+            logger.warning(f"FFmpeg MP3 failed (code {res.returncode}): {err}")
+            return False
+        return os.path.exists(output_mp3_path)
     except Exception as e:
         logger.error(f"Media to MP3 conversion failed: {e}", exc_info=True)
         return False
