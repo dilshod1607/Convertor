@@ -1,10 +1,11 @@
 import io
+import shutil
 import os
 import sys
 import time
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
 import html
 import warnings
@@ -78,7 +79,16 @@ from keyboards import (
     get_sub_admins_keyboard,
     get_broadcast_confirm_keyboard,
     get_back_keyboard,
-    get_channels_manage_keyboard
+    get_channels_manage_keyboard,
+    get_admin_vip_menu_keyboard,
+    get_admin_vip_select_days_keyboard,
+    get_admin_ads_keyboard,
+    get_admin_ads_duration_keyboard,
+    get_admin_ads_skip_link_keyboard,
+    get_admin_cache_keyboard,
+    get_server_health_keyboard,
+    get_platform_stats_keyboard,
+    get_cancel_keyboard
 )
 from session_manager import session_manager
 
@@ -99,6 +109,9 @@ os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 db = Database(path_to_db=DATABASE_PATH)
 TASHKENT_TZ = pytz.timezone('Asia/Tashkent')
 
+# Bot ishga tushgan vaqti (Uptime uchun)
+BOT_START_TIME = time.time()
+
 # Admin holatlari (States)
 ADMIN_BROADCAST_STATE = 1
 ADMIN_ADD_CH_NAME = 2
@@ -108,6 +121,82 @@ ADMIN_SEARCH_STATE = 5
 ADMIN_DM_STATE = 6
 ADMIN_ADD_SUBADMIN_STATE = 7
 ADMIN_BROADCAST_CONFIRM = 8
+ADMIN_AD_TEXT = 9
+ADMIN_AD_LINK = 10
+ADMIN_AD_DURATION_CUSTOM = 11
+ADMIN_WAITING_VIP_USER = 12
+ADMIN_WAITING_VIP_CUSTOM_DAYS = 13
+
+
+def get_uptime_str() -> str:
+    """Botning uzluksiz ishlash vaqtini hisoblash"""
+    seconds = int(time.time() - BOT_START_TIME)
+    td = timedelta(seconds=seconds)
+    days = td.days
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if days > 0:
+        return f"{days} kun, {hours} soat, {minutes} daq"
+    elif hours > 0:
+        return f"{hours} soat, {minutes} daq, {secs} soniya"
+    else:
+        return f"{minutes} daq, {secs} soniya"
+
+
+def get_system_health(db_path: str = None) -> dict:
+    """Server va tizim salomatligi ko'rsatkichlari (CPU, RAM, Disk, DB, Uptime)"""
+    cpu_pct = 0.0
+    ram_used_mb = 0
+    ram_total_mb = 0
+    ram_pct = 0.0
+    try:
+        import psutil
+        cpu_pct = psutil.cpu_percent(interval=0.2)
+        mem = psutil.virtual_memory()
+        ram_used_mb = round(mem.used / (1024 * 1024), 1)
+        ram_total_mb = round(mem.total / (1024 * 1024), 1)
+        ram_pct = mem.percent
+    except Exception:
+        pass
+
+    disk_total_gb = 0
+    disk_free_gb = 0
+    disk_pct = 0.0
+    try:
+        root_path = "/" if os.name != 'nt' else os.path.splitdrive(os.getcwd())[0] + "\\"
+        total, used, free = shutil.disk_usage(root_path)
+        disk_total_gb = round(total / (1024**3), 1)
+        disk_free_gb = round(free / (1024**3), 1)
+        disk_pct = round((used / total) * 100, 1)
+    except Exception:
+        pass
+
+    db_size_mb = 0.0
+    if db_path and os.path.exists(db_path):
+        try:
+            db_size_mb = round(os.path.getsize(db_path) / (1024 * 1024), 2)
+        except Exception:
+            pass
+
+    return {
+        'cpu_pct': cpu_pct,
+        'ram_used_mb': ram_used_mb,
+        'ram_total_mb': ram_total_mb,
+        'ram_pct': ram_pct,
+        'disk_total_gb': disk_total_gb,
+        'disk_free_gb': disk_free_gb,
+        'disk_pct': disk_pct,
+        'db_size_mb': db_size_mb,
+        'uptime': get_uptime_str()
+    }
+
+
+def with_caption_ad(caption: str) -> str:
+    """Fayl captioniga faol izoh reklamasini qo'shish"""
+    footer = db.get_caption_ad_footer()
+    if footer:
+        return f"{caption}{footer}"
+    return caption
 
 # Majburiy obunani 5 daqiqa (300s) xotirada saqlash keshi
 _sub_cache = {}
@@ -699,7 +788,7 @@ async def make_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 document=pdf_file,
                 filename=f"Convertor_{len(image_paths)}_rasm.pdf",
-                caption=f"✅ <b>Sizning PDF hujjatingiz tayyor bo'ldi!</b>\n\n📄 <b>Jami sahifalar:</b> {len(image_paths)} ta\n🤖 @convertoral_bot",
+                caption=with_caption_ad(f"✅ <b>Sizning PDF hujjatingiz tayyor bo'ldi!</b>\n\n📄 <b>Jami sahifalar:</b> {len(image_paths)} ta\n🤖 @convertoral_bot"),
                 parse_mode='HTML',
                 read_timeout=120.0,
                 write_timeout=120.0
@@ -894,7 +983,7 @@ async def merge_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=user_id,
                 document=pdf_file,
                 filename=f"Birlashtirilgan_{len(pdf_paths)}_pdf.pdf",
-                caption=(
+                caption=with_caption_ad(
                     f"✅ <b>PDF fayllar muvaffaqiyatli birlashtirildi!</b>\n\n"
                     f"📑 <b>Birlashtirilgan hujjatlar:</b> {len(pdf_paths)} ta\n"
                     f"💾 <b>Hajmi:</b> {format_file_size(file_size)}\n"
@@ -986,7 +1075,7 @@ async def compress_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     chat_id=user_id,
                     document=pdf_file,
                     filename=f"Compressed_{clean_name}",
-                    caption=(
+                    caption=with_caption_ad(
                         f"✅ <b>PDF muvaffaqiyatli siqildi!</b>\n\n"
                         f"📊 <b>Oldingi hajm:</b> {format_file_size(orig_sz)}\n"
                         f"⚡️ <b>Yangi hajm:</b> {format_file_size(new_sz)}\n"
@@ -1079,7 +1168,7 @@ async def text_to_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     chat_id=user_id,
                     document=pdf_file,
                     filename=f"{base_title}.pdf",
-                    caption=(
+                    caption=with_caption_ad(
                         f"✅ <b>Matn PDF formatiga o'tkazildi!</b>\n\n"
                         f"📄 <b>Fayl:</b> <code>{clean_name}</code>\n"
                         f"🤖 @convertoral_bot"
@@ -1176,7 +1265,7 @@ async def media_to_mp3_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     title=base_title,
                     performer=f"@{bot_username}",
                     filename=f"{base_title}.mp3",
-                    caption=(
+                    caption=with_caption_ad(
                         f"✅ <b>MP3 audio muvaffaqiyatli tayyorlandi!</b>\n\n"
                         f"🎵 <b>Nomi:</b> <code>{base_title}.mp3</code>\n"
                         f"💾 <b>Hajmi:</b> {format_file_size(os.path.getsize(output_mp3))}\n"
@@ -1281,7 +1370,7 @@ async def enhance_audio_callback(update: Update, context: ContextTypes.DEFAULT_T
                     title=f"{base_title} (Toza ovoz)",
                     performer="🎙 AI Audio Enhancer",
                     filename=f"{base_title}_enhanced.mp3",
-                    caption=(
+                    caption=with_caption_ad(
                         f"🎙 <b>AI Studio Voice Enhancer (Adobe Audio Clean)</b>\n\n"
                         f"✅ <b>Barcha shovqin, shitirlash va shamol tovushlari tozalandi!</b>\n\n"
                         f"🎵 <b>Asl fayl:</b> <code>{orig_name}</code>\n"
@@ -1388,7 +1477,7 @@ async def enhance_asmr_callback(update: Update, context: ContextTypes.DEFAULT_TY
                     title=f"{base_title} (ASMR Ruchka)",
                     performer="🎧 ASMR Audio Enhancer",
                     filename=f"{base_title}_asmr.mp3",
-                    caption=(
+                    caption=with_caption_ad(
                         f"🎧 <b>ASMR / Ruchka Yozuvi (Crisp Pen ASMR)</b>\n\n"
                         f"✨ <b>Ruchka va qalam shitirlashi maksimal tiniqlashtirildi!</b>\n\n"
                         f"📝 <b>Asl fayl:</b> <code>{orig_name}</code>\n"
@@ -1483,7 +1572,7 @@ async def office_to_pdf_callback(update: Update, context: ContextTypes.DEFAULT_T
                     chat_id=user_id,
                     document=pdf_file,
                     filename=f"{base_title}.pdf",
-                    caption=(
+                    caption=with_caption_ad(
                         f"✅ <b>Office hujjati PDF ga muvaffaqiyatli o'girildi!</b>\n\n"
                         f"📄 <b>Asl fayl:</b> <code>{clean_name}</code>\n"
                         f"💾 <b>Hajmi:</b> {format_file_size(os.path.getsize(res_pdf))}\n"
@@ -1667,7 +1756,7 @@ async def video_to_gif_callback(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.send_animation(
                     chat_id=user_id,
                     animation=gif_file,
-                    caption=f"✅ <b>GIF animatsiya tayyor!</b>\n🤖 @{bot_username}",
+                    caption=with_caption_ad(f"✅ <b>GIF animatsiya tayyor!</b>\n🤖 @{bot_username}"),
                     parse_mode='HTML',
                     read_timeout=120.0,
                     write_timeout=120.0
@@ -2075,7 +2164,7 @@ async def make_zip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=user_id,
                 document=zip_file,
                 filename=f"Archive_{int(time.time())}.zip",
-                caption=f"✅ <b>Barcha fayllar ZIP arxiviga muvaffaqiyatli jamlandi!</b>\n\n📦 <b>Jami fayllar:</b> {len(downloaded_paths)} ta\n🤖 @convertoral_bot",
+                caption=with_caption_ad(f"✅ <b>Barcha fayllar ZIP arxiviga muvaffaqiyatli jamlandi!</b>\n\n📦 <b>Jami fayllar:</b> {len(downloaded_paths)} ta\n🤖 @convertoral_bot"),
                 parse_mode='HTML',
                 read_timeout=120.0,
                 write_timeout=120.0
@@ -2188,16 +2277,16 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 # =========================================================================
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/admin buyrug'i"""
+    """/admin buyrug'i (Target panel dizayni)"""
     user_id = update.effective_user.id
     if not db.is_admin(user_id, ADMINS):
         return
 
+    is_maint = db.is_maintenance()
     await update.message.reply_html(
-        text=f"👑 <b>Assalomu alaykum, Admin {update.effective_user.mention_html()}!</b>\n\n"
-             f"Convertor Bot boshqaruv paneliga xush kelibsiz:\n"
-             f"Quyidagi menyudan kerakli bo'limni tanlang:",
-        reply_markup=get_admin_main_keyboard()
+        text="👑 <b>Admin Boshqaruv Paneli:</b>\n\n"
+             "Quyidagi bo'limlardan birini tanlang:",
+        reply_markup=get_admin_main_keyboard(is_maint)
     )
 
 
@@ -2209,17 +2298,638 @@ async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
     if not db.is_admin(query.from_user.id, ADMINS):
-        return
+        return ConversationHandler.END
 
+    is_maint = db.is_maintenance()
     try:
         await query.edit_message_text(
-            text="👑 <b>Convertor Bot — Admin Boshqaruv Paneli:</b>\n\n"
-                 "Quyidagi menyudan kerakli bo'limni tanlang:",
-            reply_markup=get_admin_main_keyboard(),
+            text="👑 <b>Admin Boshqaruv Paneli:</b>\n\n"
+                 "Quyidagi bo'limlardan birini tanlang:",
+            reply_markup=get_admin_main_keyboard(is_maint),
             parse_mode='HTML'
         )
     except Exception:
         pass
+    return ConversationHandler.END
+
+
+async def admin_close_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin panelini yopish"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+    try:
+        await query.answer()
+        await query.message.delete()
+    except Exception:
+        pass
+
+
+async def admin_server_health_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Server monitoring va salomatlik ko'rsatkichlari"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    h = get_system_health(DATABASE_PATH)
+    text = (
+        "🖥 <b>Server & Bot Salomatlik Monitoringi:</b>\n\n"
+        f"⚡ <b>CPU yuklamasi:</b> <code>{h['cpu_pct']}%</code>\n"
+        f"🧠 <b>RAM (Xotira):</b> <code>{h['ram_used_mb']} MB / {h['ram_total_mb']} MB ({h['ram_pct']}%)</code>\n"
+        f"💾 <b>Disk (Bo'sh joy):</b> <code>{h['disk_free_gb']} GB / {h['disk_total_gb']} GB ({h['disk_pct']}% band)</code>\n"
+        f"🗄 <b>SQLite DB hajmi:</b> <code>{h['db_size_mb']} MB (WAL faol)</code>\n"
+        f"⏱ <b>Uptime (Ish vaqti):</b> <code>{h['uptime']}</code>\n"
+        f"🚀 <b>Dvigatel:</b> 🟢 Faol (High-Performance Async)\n"
+    )
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=get_server_health_keyboard(),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def admin_platform_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Platformalar va formatlar bo'yicha konvertatsiya statistikasi"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    p_stats = db.get_platform_stats()
+    lines = []
+    for item in p_stats['breakdown']:
+        lines.append(f"• <b>{item['platform']}:</b> <code>{item['count']} ta</code> ({item['pct']}%)")
+
+    breakdown_text = "\n".join(lines) if lines else "<i>Hali konvertatsiyalar amalga oshirilmagan.</i>"
+    text = (
+        "📈 <b>Platformalar & Modullar Bo'yicha Statistika:</b>\n\n"
+        f"📊 <b>Jami bajarilgan konvertatsiyalar:</b> <code>{p_stats['total']} ta</code>\n\n"
+        f"{breakdown_text}"
+    )
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=get_platform_stats_keyboard(),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def admin_cache_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kesh va disk xotirasi boshqaruvi"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    doc_dir = os.path.abspath(DOCUMENTS_DIR)
+    file_count = 0
+    total_bytes = 0
+    if os.path.exists(doc_dir):
+        for root, _, files in os.walk(doc_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    total_bytes += os.path.getsize(fp)
+                    file_count += 1
+                except Exception:
+                    pass
+
+    sz_str = format_file_size(total_bytes) if total_bytes > 0 else "0 KB"
+    text = (
+        "🧹 <b>Kesh Boshqaruvi:</b>\n\n"
+        f"• Diskdagi vaqtinchalik konvertatsiya fayllari: <b>{file_count} ta</b>\n"
+        f"• Egallangan umumiy hajm: <b>{sz_str}</b>\n\n"
+        "<i>Keraksiz vaqtinchalik fayllarni tozalash orqali server xotirasini bo'shatishingiz mumkin.</i>"
+    )
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=get_admin_cache_keyboard(),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def admin_clean_disk_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diskdagi eski fayllarni tozalash"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    doc_dir = os.path.abspath(DOCUMENTS_DIR)
+    deleted = 0
+    if os.path.exists(doc_dir):
+        for root, dirs, files in os.walk(doc_dir):
+            for f in files:
+                fp = os.path.join(root, f)
+                try:
+                    os.remove(fp)
+                    deleted += 1
+                except Exception:
+                    pass
+            for d in dirs:
+                dp = os.path.join(root, d)
+                try:
+                    shutil.rmtree(dp, ignore_errors=True)
+                except Exception:
+                    pass
+
+    try:
+        await query.answer(f"✅ {deleted} ta vaqtinchalik fayl tozalandi!", show_alert=True)
+    except Exception:
+        pass
+    await admin_cache_callback(update, context)
+
+
+async def admin_vip_manage_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VIP obunachilar boshqaruv menyusi"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    vip_users = db.get_all_vip_users()
+    text = (
+        "⭐️ <b>VIP Obunachilar Boshqaruvi:</b>\n\n"
+        f"📊 <b>Faol VIP a'zolar soni:</b> <code>{len(vip_users)} ta</code>\n\n"
+        "Quyidagi tugmalar orqali istalgan foydalanuvchiga (ID yoki @username orqali) "
+        "VIP obuna berishingiz yoki faol a'zolar ro'yxatini ko'rishingiz mumkin:"
+    )
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=get_admin_vip_menu_keyboard(),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def admin_list_vip_users_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Faol VIP foydalanuvchilar ro'yxati"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    vip_users = db.get_all_vip_users()
+    if not vip_users:
+        text = "📋 <b>VIP A'zolar Ro'yxati:</b>\n\n<i>Hozirda faol VIP foydalanuvchilar mavjud emas.</i>"
+    else:
+        lines = [f"📋 <b>Faol VIP A'zolar ({len(vip_users)} ta):</b>\n"]
+        for i, u in enumerate(vip_users[:30], 1):
+            name = html.escape(str(u.get('full_name') or 'Foydalanuvchi'))
+            uname = f"@{u['username']}" if u.get('username') else f"ID: {u['user_id']}"
+            exp = u.get('vip_expires_at') or 'Cheksiz'
+            lines.append(f"{i}. <b>{name}</b> ({uname})\n   ⏳ Tugash muddati: <code>{exp}</code>")
+        if len(vip_users) > 30:
+            lines.append(f"\n<i>...va yana {len(vip_users) - 30} ta foydalanuvchi</i>")
+        text = "\n".join(lines)
+
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ VIP berish", callback_data="admin_add_vip_user")],
+        [InlineKeyboardButton("◀️ Orqaga", callback_data="admin_vip_manage")]
+    ])
+    try:
+        await query.edit_message_text(text=text, reply_markup=markup, parse_mode='HTML')
+    except Exception:
+        pass
+
+
+async def adm_pick_vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi uchun VIP muddati tanlash"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    uid = int(query.data.split(":")[1])
+    try:
+        await query.edit_message_text(
+            text=f"⭐️ <b>Foydalanuvchi (ID: <code>{uid}</code>) uchun VIP muddatini tanlang:</b>",
+            reply_markup=get_admin_vip_select_days_keyboard(uid),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def adm_give_vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchiga VIP muddatini berish"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    parts = query.data.split(":")
+    uid = int(parts[1])
+    days = int(parts[2])
+
+    db.set_user_vip_days(uid, days)
+    dur_text = "Abadiy (Cheksiz)" if days >= 36500 else f"{days} kunlik"
+
+    try:
+        await context.bot.send_message(
+            chat_id=uid,
+            text=(
+                f"🎉 <b>Tabriklaymiz!</b>\n\n"
+                f"⭐️ Sizga admin tomonidan <b>{dur_text} VIP Premium</b> obunasi taqdim etildi!\n"
+                f"Endi botdan barcha majburiy kanallarsiz va cheklovlarsiz foydalanishingiz mumkin 🚀"
+            ),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+    try:
+        await query.answer(f"✅ VIP muvaffaqiyatli berildi ({dur_text})!", show_alert=True)
+    except Exception:
+        pass
+
+    is_maint = db.is_maintenance()
+    try:
+        await query.edit_message_text(
+            text=f"✅ <b>Foydalanuvchiga (ID: <code>{uid}</code>) {dur_text} VIP obuna berildi!</b>",
+            reply_markup=get_admin_main_keyboard(is_maint),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def adm_revoke_vip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchining VIP maqomini bekor qilish"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    uid = int(query.data.split(":")[1])
+    db.revoke_user_vip(uid)
+
+    try:
+        await context.bot.send_message(
+            chat_id=uid,
+            text="⚠️ <b>Sizning VIP Premium obunangiz admin tomonidan bekor qilindi.</b>",
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+    try:
+        await query.answer("🚫 VIP obuna bekor qilindi!", show_alert=True)
+    except Exception:
+        pass
+
+    is_maint = db.is_maintenance()
+    try:
+        await query.edit_message_text(
+            text=f"🚫 <b>Foydalanuvchining (ID: <code>{uid}</code>) VIP obunasi bekor qilindi.</b>",
+            reply_markup=get_admin_main_keyboard(is_maint),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def start_add_vip_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchiga VIP berishni boshlash"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        text="⭐️ <b>Foydalanuvchiga VIP berish:</b>\n\n"
+             "Foydalanuvchining <b>Telegram ID</b> raqamini yoki <b>@username</b>ini yuboring:\n\n"
+             "<i>Masalan:</i> <code>123456789</code> yoki <code>@username</code>",
+        reply_markup=get_cancel_keyboard("admin_vip_manage"),
+        parse_mode='HTML'
+    )
+    return ADMIN_WAITING_VIP_USER
+
+
+async def receive_vip_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VIP beriladigan foydalanuvchini izlash va muddat tanlash menyusini ochish"""
+    admin_id = update.effective_user.id
+    if not db.is_admin(admin_id, ADMINS):
+        return ConversationHandler.END
+
+    query_text = update.message.text.strip()
+    u = db.search_user(query_text)
+    if not u:
+        if query_text.replace("@", "").isdigit():
+            uid = int(query_text.replace("@", ""))
+            u = {'user_id': uid, 'full_name': 'Foydalanuvchi', 'username': ''}
+        else:
+            try:
+                chat = await context.bot.get_chat(query_text)
+                uid = chat.id
+                u = {'user_id': uid, 'full_name': chat.full_name or 'Foydalanuvchi', 'username': chat.username or ''}
+            except Exception:
+                await update.message.reply_html(
+                    f"❌ <b>Foydalanuvchi topilmadi:</b> <code>{html.escape(query_text)}</code>\n"
+                    "Iltimos, qaytadan ID yoki @username kiriting:",
+                    reply_markup=get_cancel_keyboard("admin_vip_manage")
+                )
+                return ADMIN_WAITING_VIP_USER
+
+    uid = u['user_id']
+    name = html.escape(str(u.get('full_name') or 'Foydalanuvchi'))
+    uname = f"@{u['username']}" if u.get('username') else f"ID: {uid}"
+    vip_info = db.get_vip_info(uid)
+    vip_status = f"🟢 Faol (Tugash: <code>{vip_info['expires_at']}</code>)" if vip_info.get('is_vip') else "🔴 Faol emas"
+
+    text = (
+        f"⭐️ <b>Foydalanuvchi:</b> <b>{name}</b> ({uname})\n"
+        f"🆔 <b>ID:</b> <code>{uid}</code>\n"
+        f"📊 <b>Hozirgi VIP holati:</b> {vip_status}\n\n"
+        f"Qancha muddatga VIP obuna bermoqchisiz?"
+    )
+    await update.message.reply_html(text=text, reply_markup=get_admin_vip_select_days_keyboard(uid))
+    return ConversationHandler.END
+
+
+async def start_custom_vip_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Qo'lda kiritiladigan VIP kunlar so'rovi"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ConversationHandler.END
+
+    uid = int(query.data.split(":")[1])
+    context.user_data['custom_vip_uid'] = uid
+    await query.edit_message_text(
+        text=f"✍️ <b>Foydalanuvchi (ID: <code>{uid}</code>) uchun VIP kunlar sonini kiriting:</b>\n\n"
+             "<i>Masalan:</i> <code>15</code>, <code>45</code> yoki <code>180</code>",
+        reply_markup=get_cancel_keyboard("admin_vip_manage"),
+        parse_mode='HTML'
+    )
+    return ADMIN_WAITING_VIP_CUSTOM_DAYS
+
+
+async def receive_custom_vip_days(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Qo'lda kiritilgan VIP kunlarni biriktirish"""
+    admin_id = update.effective_user.id
+    if not db.is_admin(admin_id, ADMINS):
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if not text.isdigit() or int(text) <= 0:
+        await update.message.reply_html(
+            "❌ Iltimos, musbat butun son kiriting (masalan: 30):",
+            reply_markup=get_cancel_keyboard("admin_vip_manage")
+        )
+        return ADMIN_WAITING_VIP_CUSTOM_DAYS
+
+    days = int(text)
+    uid = context.user_data.get('custom_vip_uid')
+    if not uid:
+        await update.message.reply_html("❌ Foydalanuvchi ID topilmadi.", reply_markup=get_admin_main_keyboard())
+        return ConversationHandler.END
+
+    db.set_user_vip_days(uid, days)
+    dur_text = f"{days} kunlik"
+
+    try:
+        await context.bot.send_message(
+            chat_id=uid,
+            text=(
+                f"🎉 <b>Tabriklaymiz!</b>\n\n"
+                f"⭐️ Sizga admin tomonidan <b>{dur_text} VIP Premium</b> obunasi taqdim etildi!\n"
+                f"Endi botdan barcha majburiy kanallarsiz va cheklovlarsiz foydalanishingiz mumkin 🚀"
+            ),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+    context.user_data.pop('custom_vip_uid', None)
+    is_maint = db.is_maintenance()
+    await update.message.reply_html(
+        f"✅ <b>Foydalanuvchiga (ID: <code>{uid}</code>) {dur_text} VIP obuna berildi!</b>",
+        reply_markup=get_admin_main_keyboard(is_maint)
+    )
+    return ConversationHandler.END
+
+
+async def admin_ads_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Izoh reklamasi menyusi"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    active_ad = db.get_active_ad()
+    if active_ad:
+        exp_str = f"⏱ Amal qilish muddati: <b>{active_ad['expires_at']}</b>" if active_ad.get('expires_at') else "⏱ Amal qilish muddati: <b>Cheksiz</b>"
+        link_str = f"🔗 Havola: <b>{active_ad['ad_link']}</b>" if active_ad.get('ad_link') else "🔗 Havola: <i>Mavjud emas</i>"
+        text = (
+            "🎯 <b>Izoh Reklamasi Boshqaruvi:</b>\n\n"
+            "🟢 <b>Faol Reklama:</b>\n"
+            f"📝 Matn: <code>{html.escape(active_ad['ad_text'])}</code>\n"
+            f"{link_str}\n"
+            f"{exp_str}\n"
+        )
+        has_active = True
+    else:
+        text = (
+            "🎯 <b>Izoh Reklamasi Boshqaruvi:</b>\n\n"
+            "⚪️ <i>Hozirda faol reklama mavjud emas.</i>\n\n"
+            "Fayllar izohiga (tagiga) avtomatik ravishda homiy yoki kanalingiz havolasini qo'shishingiz mumkin."
+        )
+        has_active = False
+
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=get_admin_ads_keyboard(has_active),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def ad_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Faol izoh reklamasini o'chirish"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    db.disable_caption_ad()
+    try:
+        await query.answer("🗑 Reklama o'chirildi!", show_alert=True)
+    except Exception:
+        pass
+    await admin_ads_callback(update, context)
+
+
+async def start_create_ad(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Yangi izoh reklamasi yaratishni boshlash"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        text="📝 <b>Reklama matnini kiriting:</b>\n\n"
+             "<i>Masalan:</i> <code>Bizning rasmiy kanalimizga a'zo bo'ling!</code>",
+        reply_markup=get_cancel_keyboard("admin_ads"),
+        parse_mode='HTML'
+    )
+    return ADMIN_AD_TEXT
+
+
+async def receive_ad_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reklama matnini qabul qilish"""
+    admin_id = update.effective_user.id
+    if not db.is_admin(admin_id, ADMINS):
+        return ConversationHandler.END
+
+    context.user_data['new_ad_text'] = update.message.text.strip()
+    await update.message.reply_html(
+        "🔗 <b>Reklama havolasini (link) yuboring:</b>\n\n"
+        "<i>Masalan:</i> <code>https://t.me/mychannel</code>\n\n"
+        "<i>Agar link kerak bo'lmasa, quyidagi tugmani bosing:</i>",
+        reply_markup=get_admin_ads_skip_link_keyboard()
+    )
+    return ADMIN_AD_LINK
+
+
+async def receive_ad_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reklama havolasini qabul qilish"""
+    admin_id = update.effective_user.id
+    if not db.is_admin(admin_id, ADMINS):
+        return ConversationHandler.END
+
+    link = update.message.text.strip()
+    if not link.startswith(('http://', 'https://', 't.me/', 'tg://')):
+        link = f"https://{link}"
+
+    context.user_data['new_ad_link'] = link
+    await update.message.reply_html(
+        "⏱ <b>Reklama qancha vaqt amal qilsin?</b>",
+        reply_markup=get_admin_ads_duration_keyboard()
+    )
+    return ADMIN_AD_DURATION_CUSTOM
+
+
+async def ad_skip_link_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Linksiz reklama davom etish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ConversationHandler.END
+
+    context.user_data['new_ad_link'] = None
+    await query.edit_message_text(
+        text="⏱ <b>Reklama qancha vaqt amal qilsin?</b>",
+        reply_markup=get_admin_ads_duration_keyboard(),
+        parse_mode='HTML'
+    )
+    return ADMIN_AD_DURATION_CUSTOM
+
+
+async def ad_duration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reklama muddatini tanlash callback"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ConversationHandler.END
+
+    dur_val = query.data.split(":", 1)[1]
+    if dur_val == "custom":
+        await query.edit_message_text(
+            text="✍️ <b>Reklama davomiyligini soatlarda kiriting:</b>\n\n<i>Masalan:</i> <code>48</code> (2 kun uchun)",
+            reply_markup=get_cancel_keyboard("admin_ads"),
+            parse_mode='HTML'
+        )
+        return ADMIN_AD_DURATION_CUSTOM
+
+    duration_hours = float(dur_val) if dur_val != "none" else None
+    ad_text = context.user_data.get('new_ad_text')
+    ad_link = context.user_data.get('new_ad_link')
+
+    if ad_text:
+        db.set_caption_ad(ad_text=ad_text, ad_link=ad_link, duration_hours=duration_hours)
+        try:
+            await query.answer("✅ Reklama muvaffaqiyatli saqlandi va faollashtirildi!", show_alert=True)
+        except Exception:
+            pass
+
+    context.user_data.pop('new_ad_text', None)
+    context.user_data.pop('new_ad_link', None)
+    await admin_ads_callback(update, context)
+    return ConversationHandler.END
+
+
+async def receive_ad_custom_hours(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Qo'lda kiritilgan reklama soatlarini saqlash"""
+    admin_id = update.effective_user.id
+    if not db.is_admin(admin_id, ADMINS):
+        return ConversationHandler.END
+
+    try:
+        hours = float(update.message.text.strip().replace(",", "."))
+        if hours <= 0:
+            raise ValueError()
+    except ValueError:
+        await update.message.reply_html(
+            "❌ Iltimos, musbat son kiriting (masalan: 24 yoki 48):",
+            reply_markup=get_cancel_keyboard("admin_ads")
+        )
+        return ADMIN_AD_DURATION_CUSTOM
+
+    ad_text = context.user_data.get('new_ad_text')
+    ad_link = context.user_data.get('new_ad_link')
+
+    if ad_text:
+        db.set_caption_ad(ad_text=ad_text, ad_link=ad_link, duration_hours=hours)
+
+    context.user_data.pop('new_ad_text', None)
+    context.user_data.pop('new_ad_link', None)
+    is_maint = db.is_maintenance()
+    await update.message.reply_html(
+        f"✅ Reklama {hours} soatga muvaffaqiyatli o'rnatildi!",
+        reply_markup=get_admin_main_keyboard(is_maint)
+    )
     return ConversationHandler.END
 
 
@@ -2981,7 +3691,7 @@ async def admin_maintenance_callback(update: Update, context: ContextTypes.DEFAU
 
 
 async def toggle_maintenance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Texnik rejimni yoqish / o'chirish"""
+    """Texnik rejimni yoqish / o'chirish va tugmani dinamik yangilash"""
     query = update.callback_query
     if not db.is_admin(query.from_user.id, ADMINS):
         return
@@ -2990,22 +3700,17 @@ async def toggle_maintenance_callback(update: Update, context: ContextTypes.DEFA
     new_state = not cur
     db.set_maintenance(new_state)
 
+    status_msg = "yoqildi 🔴" if new_state else "o'chirildi 🟢"
     try:
-        await query.answer(f"Texnik rejim {'yoqildi' if new_state else 'o\'chirildi'}!", show_alert=True)
+        await query.answer(f"✅ Texnik rejim {status_msg}!", show_alert=True)
     except Exception:
         pass
 
-    status_text = "🔴 <b>YOQILGAN (Oddiy a'zolar uchun bot to'xtatilgan)</b>" if new_state else "🟢 <b>O'CHIRILGAN (Bot barcha uchun faol)</b>"
-    text = (
-        f"🛠 <b>Texnik Profilaktika Rejimi (Maintenance Mode)</b>\n\n"
-        f"Joriy holat: {status_text}\n\n"
-        f"<i>Agar texnik rejim yoqilsa, oddiy foydalanuvchilar botdan vaqtinchalik foydalana olishmaydi. "
-        f"Adminlar esa botdan to'siqsiz foydalanishda davom etishadi.</i>"
-    )
     try:
         await query.edit_message_text(
-            text=text,
-            reply_markup=get_maintenance_keyboard(new_state),
+            text="👑 <b>Admin Boshqaruv Paneli:</b>\n\n"
+                 "Quyidagi bo'limlardan birini tanlang:",
+            reply_markup=get_admin_main_keyboard(new_state),
             parse_mode='HTML'
         )
     except Exception:
@@ -3144,7 +3849,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_adm = db.is_admin(user_id, ADMINS)
     await update.message.reply_html(
         "❌ <b>Amal bekor qilindi.</b>",
-        reply_markup=get_admin_main_keyboard() if is_adm else None
+        reply_markup=get_admin_main_keyboard(db.is_maintenance()) if is_adm else None
     )
     return ConversationHandler.END
 
@@ -3275,6 +3980,54 @@ def main():
     )
     application.add_handler(add_channel_conv)
 
+    # 6. Admin Add VIP User Conversation
+    add_vip_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(start_add_vip_user, pattern="^admin_add_vip_user$"),
+            CallbackQueryHandler(start_custom_vip_days, pattern="^adm_give_vip_custom:(\\d+)$")
+        ],
+        states={
+            ADMIN_WAITING_VIP_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_vip_user_input)
+            ],
+            ADMIN_WAITING_VIP_CUSTOM_DAYS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_custom_vip_days)
+            ]
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(admin_vip_manage_callback, pattern="^admin_vip_manage$"),
+            CallbackQueryHandler(admin_back_callback, pattern="^admin_back$")
+        ],
+        per_message=False
+    )
+    application.add_handler(add_vip_conv)
+
+    # 7. Admin Caption Ads Conversation
+    ads_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_create_ad, pattern="^ad_create$")],
+        states={
+            ADMIN_AD_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ad_text)
+            ],
+            ADMIN_AD_LINK: [
+                CallbackQueryHandler(ad_skip_link_callback, pattern="^ad_skip_link$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ad_link)
+            ],
+            ADMIN_AD_DURATION_CUSTOM: [
+                CallbackQueryHandler(ad_duration_callback, pattern="^ad_dur:(.+)$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_ad_custom_hours)
+            ]
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(admin_ads_callback, pattern="^admin_ads$"),
+            CallbackQueryHandler(admin_back_callback, pattern="^admin_back$")
+        ],
+        per_message=False
+    )
+    application.add_handler(ads_conv)
+
     # Buyruqlar
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("admin", admin_command))
@@ -3303,9 +4056,22 @@ def main():
     application.add_handler(CallbackQueryHandler(make_zip_callback, pattern="^action_make_zip$"))
     application.add_handler(CallbackQueryHandler(clear_files_callback, pattern="^action_clear_files$"))
 
-    # Admin Callback Handlers
+    # Admin Callback Handlers - 1:1 Target Standart
     application.add_handler(CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"))
+    application.add_handler(CallbackQueryHandler(admin_close_callback, pattern="^admin_close$"))
     application.add_handler(CallbackQueryHandler(admin_stats_callback, pattern="^admin_stats$"))
+    application.add_handler(CallbackQueryHandler(admin_platform_stats_callback, pattern="^admin_platform_stats$"))
+    application.add_handler(CallbackQueryHandler(admin_server_health_callback, pattern="^admin_server_health$"))
+    application.add_handler(CallbackQueryHandler(admin_cache_callback, pattern="^admin_cache$"))
+    application.add_handler(CallbackQueryHandler(admin_clean_disk_callback, pattern="^admin_clean_disk$"))
+    application.add_handler(CallbackQueryHandler(admin_vip_manage_callback, pattern="^admin_vip_manage$"))
+    application.add_handler(CallbackQueryHandler(admin_list_vip_users_callback, pattern="^admin_list_vip_users$"))
+    application.add_handler(CallbackQueryHandler(adm_pick_vip_callback, pattern="^adm_pick_vip:(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(adm_give_vip_callback, pattern="^adm_give_vip:(\\d+):(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(adm_revoke_vip_callback, pattern="^adm_revoke_vip:(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(admin_ads_callback, pattern="^admin_ads$"))
+    application.add_handler(CallbackQueryHandler(ad_delete_callback, pattern="^ad_delete$"))
+    application.add_handler(CallbackQueryHandler(ad_duration_callback, pattern="^ad_dur:(.+)$"))
     application.add_handler(CallbackQueryHandler(admin_export_menu_callback, pattern="^admin_export$"))
     application.add_handler(CallbackQueryHandler(admin_export_xlsx_callback, pattern="^admin_export_xlsx$"))
     application.add_handler(CallbackQueryHandler(admin_backup_db_callback, pattern="^admin_backup_db$"))

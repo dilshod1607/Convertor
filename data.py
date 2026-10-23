@@ -112,6 +112,26 @@ class Database:
                 if cursor.fetchone()[0] == 0:
                     cursor.execute("INSERT INTO status (active, block) VALUES (0, 0)")
 
+                # 6. Izoh reklamalari jadvali (Caption Ads)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS caption_ads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ad_text TEXT NOT NULL,
+                    ad_link TEXT,
+                    expires_at TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    created_at TEXT
+                );
+                """)
+
+                # 7. Konvertatsiya statistikasi jadvali (Conversion Stats)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS conversion_stats (
+                    module_name TEXT PRIMARY KEY,
+                    count INTEGER DEFAULT 0
+                );
+                """)
+
                 conn.commit()
                 logger.info("Ma'lumotlar bazasi jadvallari muvaffaqiyatli tekshirildi.")
         except sqlite3.Error as e:
@@ -173,6 +193,51 @@ class Database:
                 conn.commit()
         except sqlite3.Error as e:
             logger.error(f"Error setting user VIP {user_id}: {e}")
+
+    def set_user_vip_days(self, user_id: int, days: int):
+        """Foydalanuvchiga kunlar bo'yicha VIP berish"""
+        if days >= 36500:
+            exp_str = None
+        else:
+            exp_str = (datetime.now(TASHKENT_TZ) + timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        self.set_user_vip(user_id=user_id, is_vip=1, expires_at=exp_str)
+
+    def revoke_user_vip(self, user_id: int):
+        """Foydalanuvchining VIP maqomini bekor qilish"""
+        self.set_user_vip(user_id=user_id, is_vip=0, expires_at=None)
+
+    def get_all_vip_users(self) -> list:
+        """Barcha faol VIP foydalanuvchilar ro'yxatini olish"""
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM users 
+                    WHERE is_vip = 1 AND (vip_expires_at IS NULL OR vip_expires_at > datetime('now'))
+                    ORDER BY id DESC;
+                """)
+                return [dict(r) for r in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Error fetching VIP users: {e}")
+            return []
+
+    def get_vip_info(self, user_id: int) -> dict:
+        """Foydalanuvchining VIP ma'lumotlarini olish"""
+        u = self.select_user(user_id)
+        if not u:
+            return {'is_vip': False, 'expires_at': None}
+        is_vip = bool(u.get('is_vip'))
+        exp = u.get('vip_expires_at')
+        if is_vip and exp:
+            try:
+                exp_dt = datetime.strptime(exp, "%Y-%m-%d %H:%M:%S").replace(tzinfo=TASHKENT_TZ)
+                if exp_dt < datetime.now(TASHKENT_TZ):
+                    self.revoke_user_vip(user_id)
+                    return {'is_vip': False, 'expires_at': None}
+            except Exception:
+                pass
+        return {'is_vip': is_vip, 'expires_at': exp}
 
     def select_user(self, user_id: int):
         """Foydalanuvchi ma'lumotlarini dict ko'rinishida olish"""
@@ -564,3 +629,132 @@ class Database:
         except Exception as e:
             logger.error(f"Error exporting to CSV: {e}")
             return output_path
+
+    def backup_database(self, output_path: str = None) -> str:
+        """SQLite ma'lumotlar bazasining to'liq zaxira (backup) nusxasini olish"""
+        if not output_path:
+            output_path = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite"
+        try:
+            with self._get_connection() as src_conn:
+                dst_conn = sqlite3.connect(output_path)
+                with dst_conn:
+                    src_conn.backup(dst_conn)
+                dst_conn.close()
+            return output_path
+        except Exception as e:
+            logger.error(f"Error backing up database: {e}")
+            return ""
+
+    # =========================================================================
+    # IZOH REKLAMASI (CAPTION ADS)
+    # =========================================================================
+
+    def get_active_ad(self) -> dict | None:
+        """Hozirda faol bo'lgan izoh reklamasini olish"""
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM caption_ads 
+                    WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > datetime('now'))
+                    ORDER BY id DESC LIMIT 1;
+                """)
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except sqlite3.Error as e:
+            logger.error(f"Error getting active ad: {e}")
+            return None
+
+    def set_caption_ad(self, ad_text: str, ad_link: str = None, duration_hours: float = None):
+        """Yangi izoh reklamasini o'rnatish"""
+        now = datetime.now(TASHKENT_TZ)
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        exp_str = None
+        if duration_hours is not None and duration_hours > 0:
+            exp_str = (now + timedelta(hours=duration_hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE caption_ads SET is_active = 0;")
+                cursor.execute("""
+                    INSERT INTO caption_ads (ad_text, ad_link, expires_at, is_active, created_at)
+                    VALUES (?, ?, ?, 1, ?);
+                """, (ad_text, ad_link, exp_str, now_str))
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error setting caption ad: {e}")
+
+    def disable_caption_ad(self):
+        """Faol izoh reklamasini o'chirish"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE caption_ads SET is_active = 0;")
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error disabling caption ad: {e}")
+
+    def get_caption_ad_footer(self) -> str:
+        """Chiquvchi fayllar tagiga qo'shiladigan izoh reklama matnini shakllantirish"""
+        ad = self.get_active_ad()
+        if ad and ad.get('ad_text'):
+            text = ad['ad_text'].strip()
+            link = ad.get('ad_link')
+            if link and link.startswith(('http://', 'https://', 'tg://', 't.me/')):
+                return f"\n\n📢 <a href='{link}'>{text}</a>"
+            return f"\n\n📢 <b>{text}</b>"
+        return ""
+
+    # =========================================================================
+    # PLATFORMALAR & MODULLAR STATISTIKASI
+    # =========================================================================
+
+    def get_platform_stats(self) -> dict:
+        """Konvertatsiya platformalari va modullari bo'yicha statistikani olish"""
+        default_modules = [
+            "📄 PDF & Hujjatlar",
+            "🖼 Rasm formatlari",
+            "🎵 Audio & Musiqa",
+            "🎙 AI Ovoz tozalash",
+            "🎧 ASMR Ruchka yozuvi",
+            "🔍 OCR Matn ajratish",
+            "📦 ZIP Arxivlar"
+        ]
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT module_name, count FROM conversion_stats ORDER BY count DESC;")
+                rows = cursor.fetchall()
+                data_dict = {r[0]: r[1] for r in rows}
+
+                for m in default_modules:
+                    if m not in data_dict:
+                        data_dict[m] = 0
+
+                total = sum(data_dict.values())
+                breakdown = []
+                for mod_name in default_modules:
+                    cnt = data_dict.get(mod_name, 0)
+                    pct = round((cnt / total * 100), 1) if total > 0 else 0.0
+                    breakdown.append({'platform': mod_name, 'count': cnt, 'pct': pct})
+
+                return {'total': total, 'breakdown': breakdown}
+        except sqlite3.Error as e:
+            logger.error(f"Error getting platform stats: {e}")
+            return {'total': 0, 'breakdown': []}
+
+    def increment_conversion_stat(self, module_name: str, count: int = 1):
+        """Muayyan konvertatsiya moduli hisoblagichini oshirish"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT INTO conversion_stats (module_name, count)
+                    VALUES (?, ?)
+                    ON CONFLICT(module_name) DO UPDATE SET count = count + ?;
+                """, (module_name, count, count))
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error incrementing stat for {module_name}: {e}")
