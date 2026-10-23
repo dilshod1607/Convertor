@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import datetime
 import pytz
+import html
 import warnings
 
 from telegram import (
@@ -14,9 +15,10 @@ from telegram import (
     InlineKeyboardButton,
     InputFile,
     InputMediaPhoto,
-    MenuButtonDefault
+    MenuButtonDefault,
+    ChatMember
 )
-from telegram.error import RetryAfter, BadRequest
+from telegram.error import RetryAfter, BadRequest, Forbidden
 from telegram.warnings import PTBUserWarning
 from telegram.request import HTTPXRequest
 
@@ -29,6 +31,7 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters
 )
@@ -69,6 +72,11 @@ from keyboards import (
     get_subscription_keyboard,
     get_file_action_keyboard,
     get_admin_main_keyboard,
+    get_admin_export_keyboard,
+    get_user_manage_keyboard,
+    get_maintenance_keyboard,
+    get_sub_admins_keyboard,
+    get_broadcast_confirm_keyboard,
     get_back_keyboard,
     get_channels_manage_keyboard
 )
@@ -89,12 +97,20 @@ logger = logging.getLogger(__name__)
 # Asosiy papkalar va Baza
 os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 db = Database(path_to_db=DATABASE_PATH)
+TASHKENT_TZ = pytz.timezone('Asia/Tashkent')
 
 # Admin holatlari (States)
 ADMIN_BROADCAST_STATE = 1
 ADMIN_ADD_CH_NAME = 2
 ADMIN_ADD_CH_ID = 3
 ADMIN_ADD_CH_LINK = 4
+ADMIN_SEARCH_STATE = 5
+ADMIN_DM_STATE = 6
+ADMIN_ADD_SUBADMIN_STATE = 7
+ADMIN_BROADCAST_CONFIRM = 8
+
+# Majburiy obunani 5 daqiqa (300s) xotirada saqlash keshi
+_sub_cache = {}
 
 
 def get_user_session(user_id: int) -> dict:
@@ -178,7 +194,7 @@ async def _check_single_channel(bot, user_id: int, ch: tuple):
     name = ch[0]
     try:
         member = await bot.get_chat_member(chat_id=ch_id, user_id=user_id)
-        is_sub = member.status in ['member', 'administrator', 'creator']
+        is_sub = member.status in ['member', 'administrator', 'creator', 'restricted']
         if is_sub:
             return None
         return ch
@@ -188,7 +204,24 @@ async def _check_single_channel(bot, user_id: int, ch: tuple):
 
 
 async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
-    """To'g'ridan-to'g'ri Ma'lumotlar bazasidan tekshirish"""
+    """Majburiy kanallarga a'zolikni tekshirish (5 daqiqa kesh, VIP va Admin bypass)"""
+    # 1. Adminlar majburiy obunadan ozod
+    if db.is_admin(user_id, ADMINS):
+        return True, []
+
+    # 2. VIP a'zolar majburiy obunadan ozod
+    u = db.select_user(user_id)
+    if u and u.get('is_vip') == 1:
+        return True, []
+
+    # 3. 5 daqiqalik xotira keshi
+    now = time.time()
+    if user_id in _sub_cache:
+        cache_time, is_sub = _sub_cache[user_id]
+        if now - cache_time < 300 and is_sub:
+            return True, []
+
+    # 4. Kanallarni bazadan olish
     channels = db.get_channels_from_db()
     if not channels:
         return True, []
@@ -197,10 +230,72 @@ async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
     results = await asyncio.gather(*tasks)
     not_subscribed = [r for r in results if r is not None]
 
-    if not_subscribed:
-        return False, not_subscribed
+    if not not_subscribed:
+        _sub_cache[user_id] = (now, True)
+        return True, []
 
-    return True, []
+    return False, not_subscribed
+
+
+async def check_user_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Ban va Texnik profilaktika (Maintenance) tekshiruvi"""
+    user = update.effective_user
+    if not user:
+        return False
+    user_id = user.id
+
+    # 1. Admin ban tekshiruvi
+    u = db.select_user(user_id)
+    if u:
+        is_banned = u.get("is_banned", 0) if isinstance(u, dict) else (u[7] if len(u) > 7 else 0)
+        if is_banned == 1:
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer("🚫 Siz bot ma'muriyati tomonidan bloklangansiz!", show_alert=True)
+                except Exception:
+                    pass
+            elif update.effective_message:
+                try:
+                    await update.effective_message.reply_html("🚫 <b>Siz bot ma'muriyati tomonidan bloklangansiz.</b>")
+                except Exception:
+                    pass
+            return False
+
+    # 2. Texnik rejim tekshiruvi (faqat adminlarga ruxsat beriladi)
+    if db.is_maintenance() and not db.is_admin(user_id, ADMINS):
+        msg = (
+            "🛠 <b>Texnik profilaktika!</b>\n\n"
+            "Botda yangilanish va optimallashtirish ishlari olib borilmoqda. "
+            "Birozdan so'ng qayta urinib ko'ring."
+        )
+        if update.callback_query:
+            try:
+                await update.callback_query.answer("🛠 Botda texnik ishlar olib borilmoqda!", show_alert=True)
+            except Exception:
+                pass
+        elif update.effective_message:
+            try:
+                await update.effective_message.reply_html(msg)
+            except Exception:
+                pass
+        return False
+
+    return True
+
+
+async def chat_member_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """my_chat_member: Foydalanuvchi botni bloklaganini (kicked) yoki qayta yoqqanini (member) ushlash"""
+    result = update.my_chat_member
+    if not result:
+        return
+    user_id = result.from_user.id
+    new_status = result.new_chat_member.status
+    if new_status in [ChatMember.BANNED, "kicked", "left"]:
+        db.set_user_active(user_id, 0)
+        logger.info(f"Foydalanuvchi {user_id} botni blokladi (is_active=0).")
+    elif new_status in [ChatMember.MEMBER, ChatMember.ADMINISTRATOR, "member", "administrator"]:
+        db.set_user_active(user_id, 1)
+        logger.info(f"Foydalanuvchi {user_id} botni qayta yoqdi (is_active=1).")
 
 
 # =========================================================================
@@ -210,6 +305,12 @@ async def check_user_subscription(bot, user_id: int) -> tuple[bool, list]:
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Kutilmagan xatoliklarni ushlash"""
     err = context.error
+    if isinstance(err, Forbidden):
+        if isinstance(update, Update) and update.effective_user:
+            db.set_user_active(update.effective_user.id, 0)
+            logger.info(f"Foydalanuvchi {update.effective_user.id} botni bloklaganligi (Forbidden) aniqlandi.")
+        return
+
     err_str = str(err)
     if "Query is too old" in err_str or "httpx.ReadError" in err_str or "ConnectError" in err_str:
         logger.warning(f"[Tarmoq / Vaqt o'tishi]: {type(err).__name__}: {err}")
@@ -234,7 +335,7 @@ async def _bg_save_and_log_user(bot, user):
     """Yangi foydalanuvchini fonda bazaga yozish (0 ms kutish)"""
     try:
         is_new = db.select_user(user.id) is None
-        db.add_user(user_id=user.id, full_name=user.full_name, username=user.username)
+        db.add_user(user_id=user.id, full_name=user.full_name, username=user.username, language=user.language_code or 'uz')
         if is_new and LOG_CHANNEL_ID and LOG_CHANNEL_ID.strip() != "":
             total_users = db.count_users()
             log_text = (
@@ -252,6 +353,9 @@ async def _bg_save_and_log_user(bot, user):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/start buyrug'i - LAHZADA (<20ms) javob qaytaradi"""
+    if not await check_user_access(update, context):
+        return
+
     user = update.effective_user
     user_id = user.id
 
@@ -393,6 +497,9 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Foydalanuvchi yuborgan rasm, PDF, Word, Excel, PowerPoint, ZIP, RAR, 7Z, Audio, Video, Matn fayllarini qabul qilish.
     """
+    if not await check_user_access(update, context):
+        return
+
     message = update.message
     if not message:
         return
@@ -2003,286 +2110,9 @@ async def clear_files_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
 
-
 # =========================================================================
-# ADMIN BOSHQARUV PANELI
+# MATNLI XABARLAR (FOYDALANUVCHI AMALLARI)
 # =========================================================================
-
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/admin buyrug'i"""
-    user_id = update.effective_user.id
-    if user_id not in ADMINS:
-        return
-
-    await update.message.reply_html(
-        text=f"👑 <b>Assalomu alaykum, Admin {update.effective_user.mention_html()}!</b>\n\nBoshqaruv paneliga xush kelibsiz:",
-        reply_markup=get_admin_main_keyboard()
-    )
-
-
-async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Admin bosh menyusiga qaytish"""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    if query.from_user.id not in ADMINS:
-        return
-
-    try:
-        await query.edit_message_text(
-            text="👑 <b>Admin Boshqaruv Paneli:</b>",
-            reply_markup=get_admin_main_keyboard(),
-            parse_mode='HTML'
-        )
-    except Exception:
-        pass
-
-
-async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Bot statistikasini ko'rsatish"""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    if query.from_user.id not in ADMINS:
-        return
-
-    total_users = db.count_users()
-    active, block = db.get_status()
-
-    db_size = "0 KB"
-    if os.path.exists(DATABASE_PATH):
-        db_size = f"{os.path.getsize(DATABASE_PATH) / 1024:.1f} KB"
-
-    text = (
-        f"📊 <b>Bot Statistikasi</b>\n\n"
-        f"👥 <b>Jami foydalanuvchilar:</b> {total_users} ta\n"
-        f"✅ <b>Aktiv foydalanuvchilar:</b> {active} ta\n"
-        f"🚫 <b>Bloklaganlar:</b> {block} ta\n"
-        f"💾 <b>Ma'lumotlar bazasi hajmi:</b> {db_size}\n"
-        f"━━━━━━━━━━━━━━━━━━━\n"
-        f"⏰ <b>Hozirgi vaqt:</b> {datetime.now(pytz.timezone('Asia/Tashkent')).strftime('%d/%m/%Y %H:%M:%S')}"
-    )
-
-    await query.edit_message_text(text=text, reply_markup=get_back_keyboard(), parse_mode='HTML')
-
-
-async def admin_list_channels_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Majburiy a'zolik kanallari ro'yxatini ko'rsatish"""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    if query.from_user.id not in ADMINS:
-        return
-
-    channels = db.get_channels_from_db()
-    if not channels:
-        await query.edit_message_text(
-            text="📢 <b>Hozirda hech qanday majburiy obuna kanali qo'shilmagan.</b>",
-            reply_markup=get_back_keyboard(),
-            parse_mode='HTML'
-        )
-        return
-
-    text = "📋 <b>Majburiy a'zolik kanallari ro'yxati:</b>\n<i>O'chirish uchun kanal yonidagi tugmani bosing:</i>"
-    await query.edit_message_text(
-        text=text,
-        reply_markup=get_channels_manage_keyboard(channels),
-        parse_mode='HTML'
-    )
-
-
-async def admin_delete_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Kanalni o'chirish callback"""
-    query = update.callback_query
-    try:
-        await query.answer("Kanal o'chirildi")
-    except Exception:
-        pass
-    if query.from_user.id not in ADMINS:
-        return
-
-    channel_db_id = int(query.data.replace("del_channel_", ""))
-    db.delete_channel_by_id(channel_db_id)
-
-    channels = db.get_channels_from_db()
-    if not channels:
-        await query.edit_message_text(
-            text="✅ <b>Kanal o'chirildi. Hozirda kanallar qolmadi.</b>",
-            reply_markup=get_back_keyboard(),
-            parse_mode='HTML'
-        )
-    else:
-        await query.edit_message_text(
-            text="✅ <b>Kanal muvaffaqiyatli o'chirildi!</b>\n\nQolgan kanallar ro'yxati:",
-            reply_markup=get_channels_manage_keyboard(channels),
-            parse_mode='HTML'
-        )
-
-
-async def admin_backup_db_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """SQLite bazasini yuklab olish"""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    if query.from_user.id not in ADMINS:
-        return
-
-    if os.path.exists(DATABASE_PATH):
-        with open(DATABASE_PATH, 'rb') as f:
-            await context.bot.send_document(
-                chat_id=query.from_user.id,
-                document=f,
-                filename="database_backup.db",
-                caption="💾 <b>SQLite ma'lumotlar bazasi nusxasi</b>",
-                parse_mode='HTML',
-                read_timeout=120.0,
-                write_timeout=120.0
-            )
-    else:
-        await query.message.reply_text("❌ Baza fayli topilmadi!")
-
-
-async def admin_backup_xlsx_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Excel formatida foydalanuvchilar bazasini yuklash"""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    if query.from_user.id not in ADMINS:
-        return
-
-    excel_file = "users_export.xlsx"
-    db.export_users_to_excel(excel_file)
-
-    if os.path.exists(excel_file):
-        with open(excel_file, 'rb') as f:
-            await context.bot.send_document(
-                chat_id=query.from_user.id,
-                document=f,
-                filename=f"Users_{datetime.now().strftime('%Y_%m_%d')}.xlsx",
-                caption="📑 <b>Foydalanuvchilar ro'yxati (Excel jadval)</b>",
-                parse_mode='HTML',
-                read_timeout=120.0,
-                write_timeout=120.0
-            )
-        try:
-            os.remove(excel_file)
-        except Exception:
-            pass
-
-
-# =========================================================================
-# ADMIN XABAR YUBORISH (BROADCAST) CONVERSATION
-# =========================================================================
-
-async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast jarayonini boshlash"""
-    query = update.callback_query
-    try:
-        await query.answer()
-    except Exception:
-        pass
-    if query.from_user.id not in ADMINS:
-        return ConversationHandler.END
-
-    await query.edit_message_text(
-        text="📨 <b>Barcha foydalanuvchilarga yuboriladigan xabarni yuboring:</b>\n\n<i>(Matn, rasm, video, audio yoki forward xabar yuborishingiz mumkin. Bekor qilish uchun /cancel deb yozing)</i>",
-        parse_mode='HTML'
-    )
-    return ADMIN_BROADCAST_STATE
-
-
-async def execute_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Xabarni barcha foydalanuvchilarga tarqatish"""
-    user_id = update.effective_user.id
-    if user_id not in ADMINS:
-        return ConversationHandler.END
-
-    message = update.message
-    users = db.select_all_users()
-    total_users = len(users)
-
-    if total_users == 0:
-        await message.reply_text("❌ Bazada birorta ham foydalanuvchi topilmadi.")
-        return ConversationHandler.END
-
-    status_msg = await message.reply_html(
-        f"🚀 <b>Xabar yuborish boshlandi...</b>\n\n"
-        f"👥 Jami qabul qiluvchilar: {total_users} ta"
-    )
-
-    success = 0
-    blocked = 0
-    start_time = time.time()
-
-    for idx, u in enumerate(users):
-        target_id = u[0]
-        try:
-            await context.bot.copy_message(
-                chat_id=target_id,
-                from_chat_id=message.chat_id,
-                message_id=message.message_id
-            )
-            success += 1
-        except Exception as e:
-            blocked += 1
-            logger.debug(f"User {target_id} xabar olmadi: {e}")
-
-        await asyncio.sleep(0.04)
-
-        if (idx + 1) % 100 == 0:
-            try:
-                await status_msg.edit_text(
-                    f"🚀 <b>Xabar yuborilmoqda...</b>\n\n"
-                    f"📤 Yuborildi: {success}\n"
-                    f"🚫 Yetib bormadi: {blocked}\n"
-                    f"📊 Progress: {idx + 1}/{total_users}",
-                    parse_mode='HTML'
-                )
-            except Exception:
-                pass
-
-    elapsed = int(time.time() - start_time)
-    db.update_status(active=success, block=blocked)
-
-    report_text = (
-        f"✅ <b>Xabar tarqatish yakunlandi!</b>\n\n"
-        f"👥 <b>Jami foydalanuvchilar:</b> {total_users} ta\n"
-        f"📤 <b>Muvaffaqiyatli yetkazildi:</b> {success} ta\n"
-        f"🚫 <b>Bloklagan / Yetib bormagan:</b> {blocked} ta\n"
-        f"⏱ <b>Sarflangan vaqt:</b> {elapsed} soniya"
-    )
-
-    await status_msg.edit_text(text=report_text, reply_markup=get_back_keyboard(), parse_mode='HTML')
-    return ConversationHandler.END
-
-
-async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Amalni bekor qilish"""
-    user_id = update.effective_user.id
-    sess = get_user_session(user_id)
-    if sess.get('waiting_for_password') or sess.get('items'):
-        user_dir = sess.get('user_dir') or get_user_dir(DOCUMENTS_DIR, user_id)
-        cleanup_user_files(user_dir)
-        reset_user_session(user_id)
-        await update.message.reply_html("❌ <b>Amal bekor qilindi va fayllar tozalandi.</b>")
-        return ConversationHandler.END
-
-    await update.message.reply_html(
-        "❌ <b>Amal bekor qilindi.</b>",
-        reply_markup=get_admin_main_keyboard() if user_id in ADMINS else None
-    )
-    return ConversationHandler.END
-
 
 async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Oddiy matnli xabarlarni qayta ishlash (masalan, arxiv paroli kiritilganda)"""
@@ -2354,8 +2184,890 @@ async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # =========================================================================
-# ADMIN KANAL QO'SHISH CONVERSATION
+# ADMIN BOSHQARUV PANELI VA HANDLERLAR
 # =========================================================================
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admin buyrug'i"""
+    user_id = update.effective_user.id
+    if not db.is_admin(user_id, ADMINS):
+        return
+
+    await update.message.reply_html(
+        text=f"👑 <b>Assalomu alaykum, Admin {update.effective_user.mention_html()}!</b>\n\n"
+             f"Convertor Bot boshqaruv paneliga xush kelibsiz:\n"
+             f"Quyidagi menyudan kerakli bo'limni tanlang:",
+        reply_markup=get_admin_main_keyboard()
+    )
+
+
+async def admin_back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin bosh menyusiga qaytish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    try:
+        await query.edit_message_text(
+            text="👑 <b>Convertor Bot — Admin Boshqaruv Paneli:</b>\n\n"
+                 "Quyidagi menyudan kerakli bo'limni tanlang:",
+            reply_markup=get_admin_main_keyboard(),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+    return ConversationHandler.END
+
+
+async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot statistikasini to'liq ko'rsatish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    stats = db.get_detailed_stats()
+
+    db_size = "0 KB"
+    if os.path.exists(DATABASE_PATH):
+        sz = os.path.getsize(DATABASE_PATH)
+        if sz >= 1024 * 1024:
+            db_size = f"{sz / (1024 * 1024):.2f} MB"
+        else:
+            db_size = f"{sz / 1024:.1f} KB"
+
+    text = (
+        f"📊 <b>Convertor Bot — To'liq Statistika</b>\n\n"
+        f"👥 <b>Jami foydalanuvchilar:</b> {stats['total']:,} ta\n"
+        f"├ 🟢 <b>Faol a'zolar:</b> {stats['active']:,} ta\n"
+        f"├ ⏸ <b>Botni bloklaganlar:</b> {stats['blocked']:,} ta\n"
+        f"└ 🔴 <b>Admin bloklagan:</b> {stats['banned']:,} ta\n\n"
+        f"✨ <b>Bugun qo'shilganlar:</b> +{stats['today_joined']:,} ta\n"
+        f"⚡️ <b>24 soatda faol:</b> {stats['active_24h']:,} ta\n"
+        f"📅 <b>7 kunda faol:</b> {stats['active_7d']:,} ta\n\n"
+        f"⭐️ <b>VIP foydalanuvchilar:</b> {stats['vip']:,} ta\n"
+        f"📢 <b>Majburiy kanallar soni:</b> {stats['channels_count']} ta\n"
+        f"💾 <b>Baza fayli hajmi:</b> {db_size}\n"
+        f"────────────────────────\n"
+        f"🕒 <i>Vaqt: {datetime.now(TASHKENT_TZ).strftime('%d.%m.%Y %H:%M:%S')}</i>"
+    )
+
+    try:
+        await query.edit_message_text(text=text, reply_markup=get_back_keyboard("admin_back"), parse_mode='HTML')
+    except Exception:
+        pass
+
+
+def format_user_card(user: dict) -> str:
+    """Foydalanuvchi ma'lumotlarini profil kartasi ko'rinishida formatlash"""
+    uid = user.get('user_id')
+    raw_name = user.get('full_name') or "Noma'lum"
+    fname = html.escape(str(raw_name))
+    uname = f"@{user.get('username')}" if user.get('username') else "Mavjud emas"
+    lang = user.get('language') or 'uz'
+    created = user.get('created_at') or "Noma'lum"
+    last_act = user.get('last_active') or "Noma'lum"
+
+    if user.get('is_banned'):
+        status = "🔴 Bloklangan (Admin tomonidan)"
+    elif user.get('is_active') == 0:
+        status = "⏸ Botni bloklagan (Kicked)"
+    else:
+        status = "🟢 Faol a'zo"
+
+    vip_status = "⭐ Faol VIP" if user.get('is_vip') else "Oddiy"
+
+    return (
+        f"👤 <b>Foydalanuvchi Profili</b>\n\n"
+        f"🆔 <b>Telegram ID:</b> <code>{uid}</code>\n"
+        f"👤 <b>Ismi:</b> {fname}\n"
+        f"🌐 <b>Username:</b> {uname}\n"
+        f"🇺🇿 <b>Tili:</b> {lang}\n"
+        f"📅 <b>Ro'yxatdan o'tgan:</b> {created}\n"
+        f"⚡ <b>Oxirgi faollik:</b> {last_act}\n"
+        f"📊 <b>Holati:</b> {status}\n"
+        f"⭐️ <b>VIP maqomi:</b> {vip_status}"
+    )
+
+
+async def start_search_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi qidirishni boshlash"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        text="🔍 <b>Foydalanuvchini qidirish:</b>\n\n"
+             "Qidirilayotgan foydalanuvchining <b>Telegram ID</b> raqamini yoki <b>@username</b>ini kiriting:\n\n"
+             "<i>(Bekor qilish uchun /cancel deb yozing)</i>",
+        parse_mode='HTML'
+    )
+    return ADMIN_SEARCH_STATE
+
+
+async def receive_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Qidiruv so'rovini qabul qilish va natijani chiqarish"""
+    user_id = update.effective_user.id
+    if not db.is_admin(user_id, ADMINS):
+        return ConversationHandler.END
+
+    search_text = update.message.text.strip()
+    user_data = db.search_user(search_text)
+
+    if not user_data:
+        await update.message.reply_html(
+            f"❌ <b>'{html.escape(search_text)}'</b> bo'yicha foydalanuvchi topilmadi.\n\n"
+            f"ID yoki username to'g'ri ekanligini tekshirib qaytadan kiriting yoki /cancel yozing."
+        )
+        return ADMIN_SEARCH_STATE
+
+    text = format_user_card(user_data)
+    markup = get_user_manage_keyboard(
+        user_id=user_data['user_id'],
+        is_banned=bool(user_data.get('is_banned', 0)),
+        is_vip=bool(user_data.get('is_vip', 0))
+    )
+    await update.message.reply_html(text=text, reply_markup=markup)
+    return ConversationHandler.END
+
+
+async def user_profile_by_id_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ID orqali profilni ko'rish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    target_id = int(query.data.replace("user_search_id_", ""))
+    user_data = db.select_user(target_id)
+    if not user_data:
+        try:
+            await query.answer("Foydalanuvchi topilmadi!", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    text = format_user_card(user_data)
+    markup = get_user_manage_keyboard(
+        user_id=target_id,
+        is_banned=bool(user_data.get('is_banned', 0)),
+        is_vip=bool(user_data.get('is_vip', 0))
+    )
+    try:
+        await query.edit_message_text(text=text, reply_markup=markup, parse_mode='HTML')
+    except Exception:
+        pass
+
+
+async def ban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchini bloklash (Ban)"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+    target_id = int(query.data.replace("ban_", ""))
+    db.set_user_banned(target_id, 1)
+    try:
+        await query.answer("Foydalanuvchi bloklandi!", show_alert=True)
+    except Exception:
+        pass
+
+    user_data = db.select_user(target_id)
+    if user_data:
+        text = format_user_card(user_data)
+        markup = get_user_manage_keyboard(
+            user_id=target_id,
+            is_banned=True,
+            is_vip=bool(user_data.get('is_vip', 0))
+        )
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup, parse_mode='HTML')
+        except Exception:
+            pass
+
+
+async def unban_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchini blokdan chiqarish (Unban)"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+    target_id = int(query.data.replace("unban_", ""))
+    db.set_user_banned(target_id, 0)
+    try:
+        await query.answer("Foydalanuvchi blokdan chiqarildi!", show_alert=True)
+    except Exception:
+        pass
+
+    user_data = db.select_user(target_id)
+    if user_data:
+        text = format_user_card(user_data)
+        markup = get_user_manage_keyboard(
+            user_id=target_id,
+            is_banned=False,
+            is_vip=bool(user_data.get('is_vip', 0))
+        )
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup, parse_mode='HTML')
+        except Exception:
+            pass
+
+
+async def vip_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VIP maqomini berish"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+    target_id = int(query.data.replace("vip_", ""))
+    db.set_user_vip(target_id, 1)
+    try:
+        await query.answer("VIP maqomi berildi!", show_alert=True)
+    except Exception:
+        pass
+
+    user_data = db.select_user(target_id)
+    if user_data:
+        text = format_user_card(user_data)
+        markup = get_user_manage_keyboard(
+            user_id=target_id,
+            is_banned=bool(user_data.get('is_banned', 0)),
+            is_vip=True
+        )
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup, parse_mode='HTML')
+        except Exception:
+            pass
+
+
+async def unvip_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """VIP maqomini olib tashlash"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+    target_id = int(query.data.replace("unvip_", ""))
+    db.set_user_vip(target_id, 0)
+    try:
+        await query.answer("VIP maqomi olib tashlandi!", show_alert=True)
+    except Exception:
+        pass
+
+    user_data = db.select_user(target_id)
+    if user_data:
+        text = format_user_card(user_data)
+        markup = get_user_manage_keyboard(
+            user_id=target_id,
+            is_banned=bool(user_data.get('is_banned', 0)),
+            is_vip=False
+        )
+        try:
+            await query.edit_message_text(text=text, reply_markup=markup, parse_mode='HTML')
+        except Exception:
+            pass
+
+
+async def start_dm_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchiga to'g'ridan-to'g'ri xabar yuborishni boshlash"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ConversationHandler.END
+
+    target_id = int(query.data.replace("dm_", ""))
+    context.user_data['dm_target_id'] = target_id
+
+    await query.message.reply_html(
+        f"✉️ <b>Foydalanuvchiga xabar yuborish:</b>\n\n"
+        f"🆔 Qabul qiluvchi: <code>{target_id}</code>\n\n"
+        f"Yuboriladigan xabarni kiriting (matn, rasm, video, fayl yoki ovozli xabar):\n"
+        f"<i>(Bekor qilish uchun /cancel deb yozing)</i>"
+    )
+    return ADMIN_DM_STATE
+
+
+async def send_dm_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xabarni foydalanuvchiga jo'natish"""
+    admin_id = update.effective_user.id
+    if not db.is_admin(admin_id, ADMINS):
+        return ConversationHandler.END
+
+    target_id = context.user_data.get('dm_target_id')
+    if not target_id:
+        await update.message.reply_html("❌ Foydalanuvchi IDsi topilmadi.")
+        return ConversationHandler.END
+
+    try:
+        await context.bot.copy_message(
+            chat_id=target_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=update.message.message_id
+        )
+        await update.message.reply_html(
+            f"✅ <b>Xabar muvaffaqiyatli yuborildi!</b>\n\n"
+            f"🆔 Qabul qiluvchi: <code>{target_id}</code>",
+            reply_markup=get_admin_main_keyboard()
+        )
+    except Forbidden:
+        db.set_user_active(target_id, 0)
+        await update.message.reply_html(
+            f"❌ <b>Xabar yetkazilmadi!</b> Foydalanuvchi botni bloklagan (bazada <code>is_active=0</code> qilindi).",
+            reply_markup=get_admin_main_keyboard()
+        )
+    except Exception as e:
+        await update.message.reply_html(
+            f"❌ <b>Xatolik yuz berdi:</b> {e}",
+            reply_markup=get_admin_main_keyboard()
+        )
+
+    context.user_data.pop('dm_target_id', None)
+    return ConversationHandler.END
+
+
+async def admin_export_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Baza eksport formatlarini tanlash menyusi"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    await query.edit_message_text(
+        text="📁 <b>Ma'lumotlar bazasini yuklab olish</b>\n\n"
+             "O'zingizga kerakli eksport formatini tanlang:\n\n"
+             "• 📊 <b>Excel (.xlsx):</b> Stillangan, rangli badgeli jadvallar\n"
+             "• 💾 <b>SQLite (.sqlite):</b> Barcha jadvallarning to'liq zaxira nusxasi\n"
+             "• 📄 <b>CSV (.csv):</b> UTF-8 BOM bilan universal jadval",
+        reply_markup=get_admin_export_keyboard(),
+        parse_mode='HTML'
+    )
+
+
+async def admin_export_xlsx_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Professional Excel faylini jo'natish"""
+    query = update.callback_query
+    try:
+        await query.answer("Excel tayyorlanmoqda...")
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    excel_file = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    path = db.export_users_to_excel(excel_file)
+
+    if os.path.exists(path):
+        with open(path, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=query.from_user.id,
+                document=f,
+                filename=f"Convertor_Users_{datetime.now().strftime('%Y_%m_%d')}.xlsx",
+                caption="📊 <b>Convertor Bot — Foydalanuvchilar Ro'yxati (Excel)</b>\n\n"
+                        "<i>Header: Navy Blue | Freeze Panes | Rangli Holat Badgelari</i>",
+                parse_mode='HTML',
+                read_timeout=120.0,
+                write_timeout=120.0
+            )
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    else:
+        await query.message.reply_html("❌ Excel faylini yaratishda xatolik yuz berdi!")
+
+
+async def admin_backup_db_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """SQLite zaxirasini jo'natish"""
+    query = update.callback_query
+    try:
+        await query.answer("Zaxira nusxa olinmoqda...")
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    backup_path = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite"
+    path = db.backup_database(backup_path)
+
+    if path and os.path.exists(path):
+        with open(path, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=query.from_user.id,
+                document=f,
+                filename=f"Convertor_DB_{datetime.now().strftime('%Y_%m_%d')}.sqlite",
+                caption="💾 <b>Convertor Bot — SQLite Ma'lumotlar Bazasi Zaxira Nusxasi</b>",
+                parse_mode='HTML',
+                read_timeout=120.0,
+                write_timeout=120.0
+            )
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    else:
+        await query.message.reply_html("❌ Zaxira nusxa fayli yaratilmadi!")
+
+
+async def admin_export_csv_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """CSV eksportini jo'natish"""
+    query = update.callback_query
+    try:
+        await query.answer("CSV fayl tayyorlanmoqda...")
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    csv_path = f"users_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    path = db.export_users_to_csv(csv_path)
+
+    if os.path.exists(path):
+        with open(path, 'rb') as f:
+            await context.bot.send_document(
+                chat_id=query.from_user.id,
+                document=f,
+                filename=f"Convertor_Users_{datetime.now().strftime('%Y_%m_%d')}.csv",
+                caption="📄 <b>Convertor Bot — Foydalanuvchilar Ro'yxati (CSV UTF-8)</b>",
+                parse_mode='HTML',
+                read_timeout=120.0,
+                write_timeout=120.0
+            )
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    else:
+        await query.message.reply_html("❌ CSV faylini yaratishda xatolik yuz berdi!")
+
+
+async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast jarayonini boshlash"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        text="🚀 <b>Xabar tarqatish (Broadcast)</b>\n\n"
+             "Barcha faol foydalanuvchilarga yuboriladigan xabarni yuboring:\n"
+             "<i>(Matn, rasm, video, audio yoki forward xabar yuborishingiz mumkin. Bekor qilish uchun /cancel deb yozing)</i>",
+        parse_mode='HTML'
+    )
+    return ADMIN_BROADCAST_STATE
+
+
+async def receive_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xabarni qabul qilish va tasdiqlash menyusini chiqarish"""
+    user_id = update.effective_user.id
+    if not db.is_admin(user_id, ADMINS):
+        return ConversationHandler.END
+
+    context.user_data['broadcast_msg_id'] = update.message.message_id
+    context.user_data['broadcast_chat_id'] = update.message.chat_id
+    context.user_data['broadcast_pin'] = False
+
+    await update.message.reply_html(
+        "📢 <b>Xabar qabul qilindi!</b>\n\n"
+        "Xabarni foydalanuvchilarga pin (qadash) qilishni xohlaysizmi?\n"
+        "Sozlab bo'lgach, <b>YUBORISHNI BOSHLASH</b> tugmasini bosing:",
+        reply_markup=get_broadcast_confirm_keyboard(pin=False)
+    )
+    return ADMIN_BROADCAST_CONFIRM
+
+
+async def toggle_broadcast_pin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Qadash holatini o'zgartirish (toggle)"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return ADMIN_BROADCAST_CONFIRM
+
+    current_pin = context.user_data.get('broadcast_pin', False)
+    new_pin = not current_pin
+    context.user_data['broadcast_pin'] = new_pin
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=get_broadcast_confirm_keyboard(pin=new_pin))
+    except Exception:
+        pass
+    return ADMIN_BROADCAST_CONFIRM
+
+
+async def execute_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Xabarni barcha faol foydalanuvchilarga xavfsiz va jonli progress bilan tarqatish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    admin_id = query.from_user.id
+    if not db.is_admin(admin_id, ADMINS):
+        return ConversationHandler.END
+
+    broadcast_msg_id = context.user_data.get('broadcast_msg_id')
+    broadcast_chat_id = context.user_data.get('broadcast_chat_id')
+    should_pin = context.user_data.get('broadcast_pin', False)
+
+    if not broadcast_msg_id or not broadcast_chat_id:
+        await query.edit_message_text("❌ Xabar ma'lumotlari topilmadi. Qaytadan urinib ko'ring.")
+        return ConversationHandler.END
+
+    user_ids = db.select_active_user_ids()
+    total_users = len(user_ids)
+
+    if total_users == 0:
+        await query.edit_message_text("❌ Bazada faol foydalanuvchilar topilmadi.")
+        return ConversationHandler.END
+
+    status_msg = await query.edit_message_text(
+        f"🚀 <b>Xabar tarqatish boshlandi...</b>\n\n"
+        f"👥 <b>Qabul qiluvchilar:</b> {total_users} ta\n"
+        f"📌 <b>Qadash:</b> {'Ha' if should_pin else 'Yo\'q'}\n"
+        f"⏳ <i>Jarayon davom etmoqda...</i>",
+        parse_mode='HTML'
+    )
+
+    success = 0
+    blocked = 0
+    failed = 0
+    start_time = time.time()
+    last_update_time = time.time()
+
+    for idx, target_id in enumerate(user_ids):
+        try:
+            sent_msg = await context.bot.copy_message(
+                chat_id=target_id,
+                from_chat_id=broadcast_chat_id,
+                message_id=broadcast_msg_id
+            )
+            success += 1
+            if should_pin and sent_msg:
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=target_id,
+                        message_id=sent_msg.message_id,
+                        disable_notification=True
+                    )
+                except Exception:
+                    pass
+        except Forbidden:
+            blocked += 1
+            db.set_user_active(target_id, 0)
+        except RetryAfter as e:
+            logger.warning(f"Broadcast flood limit. Waiting {e.retry_after + 1}s...")
+            await asyncio.sleep(e.retry_after + 1)
+            try:
+                sent_msg = await context.bot.copy_message(
+                    chat_id=target_id,
+                    from_chat_id=broadcast_chat_id,
+                    message_id=broadcast_msg_id
+                )
+                success += 1
+                if should_pin and sent_msg:
+                    try:
+                        await context.bot.pin_chat_message(
+                            chat_id=target_id,
+                            message_id=sent_msg.message_id,
+                            disable_notification=True
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            logger.debug(f"Broadcast error user {target_id}: {e}")
+
+        await asyncio.sleep(0.04)
+
+        now = time.time()
+        if now - last_update_time >= 5.0 or (idx + 1) == total_users:
+            last_update_time = now
+            percent = int(((idx + 1) / total_users) * 100)
+            bar = "█" * (percent // 10) + "░" * (10 - (percent // 10))
+            elapsed = int(now - start_time)
+            try:
+                await status_msg.edit_text(
+                    f"🚀 <b>Xabar tarqatilmoqda...</b>\n\n"
+                    f"[{bar}] <b>{percent}%</b> ({idx + 1}/{total_users})\n\n"
+                    f"✅ <b>Muvaffaqiyatli:</b> {success} ta\n"
+                    f"⏸ <b>Botni bloklagan:</b> {blocked} ta\n"
+                    f"⚠️ <b>Xatolik:</b> {failed} ta\n"
+                    f"⏱ <b>O'tgan vaqt:</b> {elapsed} soniya",
+                    parse_mode='HTML'
+                )
+            except Exception:
+                pass
+
+    elapsed = int(time.time() - start_time)
+    db.update_status(active=success, block=blocked)
+
+    report_text = (
+        f"✅ <b>Xabar tarqatish yakunlandi!</b>\n\n"
+        f"👥 <b>Jami rejalashtirilgan:</b> {total_users} ta\n"
+        f"✅ <b>Muvaffaqiyatli yetkazildi:</b> {success} ta\n"
+        f"⏸ <b>Botni bloklaganlar:</b> {blocked} ta <i>(bazada faolsizlantirildi)</i>\n"
+        f"⚠️ <b>Yetib bormagan / Xatolik:</b> {failed} ta\n"
+        f"⏱ <b>Sarflangan vaqt:</b> {elapsed} soniya"
+    )
+
+    try:
+        await status_msg.edit_text(text=report_text, reply_markup=get_back_keyboard("admin_back"), parse_mode='HTML')
+    except Exception:
+        pass
+
+    context.user_data.pop('broadcast_msg_id', None)
+    context.user_data.pop('broadcast_chat_id', None)
+    context.user_data.pop('broadcast_pin', None)
+    return ConversationHandler.END
+
+
+async def admin_subadmins_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sub-adminlar ro'yxatini ko'rsatish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    sub_admins = db.get_sub_admins()
+    text = (
+        f"👑 <b>Sub-Adminlar Boshqaruvi</b>\n\n"
+        f"Asosiy adminlar (config): <code>{ADMINS}</code>\n"
+        f"Qo'shimcha sub-adminlar soni: <b>{len(sub_admins)} ta</b>\n\n"
+        f"<i>Yordamchi admin qo'shish yoki o'chirish uchun quyidagi tugmalardan foydalaning:</i>"
+    )
+    await query.edit_message_text(
+        text=text,
+        reply_markup=get_sub_admins_keyboard(sub_admins),
+        parse_mode='HTML'
+    )
+
+
+async def del_subadmin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sub-adminni o'chirish"""
+    query = update.callback_query
+    if query.from_user.id not in ADMINS:
+        try:
+            await query.answer("Faqat asosiy admin sub-adminlarni o'chira oladi!", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    sub_id = int(query.data.replace("del_subadmin_", ""))
+    db.delete_sub_admin(sub_id)
+    try:
+        await query.answer("Sub-admin o'chirildi!", show_alert=True)
+    except Exception:
+        pass
+
+    sub_admins = db.get_sub_admins()
+    text = (
+        f"👑 <b>Sub-Adminlar Boshqaruvi</b>\n\n"
+        f"Asosiy adminlar (config): <code>{ADMINS}</code>\n"
+        f"Qo'shimcha sub-adminlar soni: <b>{len(sub_admins)} ta</b>"
+    )
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=get_sub_admins_keyboard(sub_admins),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def start_add_subadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sub-admin qo'shishni boshlash"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if query.from_user.id not in ADMINS:
+        try:
+            await query.answer("Faqat asosiy admin yangi sub-admin qo'sha oladi!", show_alert=True)
+        except Exception:
+            pass
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        text="➕ <b>Yangi sub-admin qo'shish:</b>\n\n"
+             "Yordamchi admin bo'ladigan foydalanuvchining <b>Telegram ID</b> raqamini kiriting:\n\n"
+             "<i>(Bekor qilish uchun /cancel deb yozing)</i>",
+        parse_mode='HTML'
+    )
+    return ADMIN_ADD_SUBADMIN_STATE
+
+
+async def receive_subadmin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sub-admin ID sini qabul qilish va saqlash"""
+    admin_id = update.effective_user.id
+    if admin_id not in ADMINS:
+        return ConversationHandler.END
+
+    text = update.message.text.strip()
+    if not text.isdigit():
+        await update.message.reply_html(
+            "❌ <b>Noto'g'ri format!</b> Faqat raqamlardan iborat Telegram ID kiriting:\n"
+            "<i>(Masalan: <code>123456789</code> yoki /cancel)</i>"
+        )
+        return ADMIN_ADD_SUBADMIN_STATE
+
+    new_sub_id = int(text)
+    success = db.add_sub_admin(new_sub_id, added_by=admin_id)
+
+    if success:
+        await update.message.reply_html(
+            f"✅ <b>Yangi sub-admin muvaffaqiyatli qo'shildi!</b>\n\n"
+            f"🆔 <b>Admin ID:</b> <code>{new_sub_id}</code>",
+            reply_markup=get_admin_main_keyboard()
+        )
+    else:
+        await update.message.reply_html(
+            f"⚠️ Ushbu foydalanuvchi allaqachon sub-admin yoki xatolik yuz berdi.",
+            reply_markup=get_admin_main_keyboard()
+        )
+    return ConversationHandler.END
+
+
+async def admin_maintenance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Texnik profilaktika menyusi"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    is_maint = db.is_maintenance()
+    status_text = "🔴 <b>YOQILGAN (Oddiy a'zolar uchun bot to'xtatilgan)</b>" if is_maint else "🟢 <b>O'CHIRILGAN (Bot barcha uchun faol)</b>"
+
+    text = (
+        f"🛠 <b>Texnik Profilaktika Rejimi (Maintenance Mode)</b>\n\n"
+        f"Joriy holat: {status_text}\n\n"
+        f"<i>Agar texnik rejim yoqilsa, oddiy foydalanuvchilar botdan vaqtinchalik foydalana olishmaydi. "
+        f"Adminlar esa botdan to'siqsiz foydalanishda davom etishadi.</i>"
+    )
+    await query.edit_message_text(
+        text=text,
+        reply_markup=get_maintenance_keyboard(is_maint),
+        parse_mode='HTML'
+    )
+
+
+async def toggle_maintenance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Texnik rejimni yoqish / o'chirish"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    cur = db.is_maintenance()
+    new_state = not cur
+    db.set_maintenance(new_state)
+
+    try:
+        await query.answer(f"Texnik rejim {'yoqildi' if new_state else 'o\'chirildi'}!", show_alert=True)
+    except Exception:
+        pass
+
+    status_text = "🔴 <b>YOQILGAN (Oddiy a'zolar uchun bot to'xtatilgan)</b>" if new_state else "🟢 <b>O'CHIRILGAN (Bot barcha uchun faol)</b>"
+    text = (
+        f"🛠 <b>Texnik Profilaktika Rejimi (Maintenance Mode)</b>\n\n"
+        f"Joriy holat: {status_text}\n\n"
+        f"<i>Agar texnik rejim yoqilsa, oddiy foydalanuvchilar botdan vaqtinchalik foydalana olishmaydi. "
+        f"Adminlar esa botdan to'siqsiz foydalanishda davom etishadi.</i>"
+    )
+    try:
+        await query.edit_message_text(
+            text=text,
+            reply_markup=get_maintenance_keyboard(new_state),
+            parse_mode='HTML'
+        )
+    except Exception:
+        pass
+
+
+async def admin_list_channels_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Majburiy a'zolik kanallari ro'yxatini ko'rsatish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    channels = db.get_channels_from_db()
+    if not channels:
+        await query.edit_message_text(
+            text="📢 <b>Hozirda hech qanday majburiy obuna kanali qo'shilmagan.</b>",
+            reply_markup=get_channels_manage_keyboard([]),
+            parse_mode='HTML'
+        )
+        return
+
+    text = "📋 <b>Majburiy a'zolik kanallari ro'yxati:</b>\n<i>O'chirish uchun kanal yonidagi tugmani bosing:</i>"
+    await query.edit_message_text(
+        text=text,
+        reply_markup=get_channels_manage_keyboard(channels),
+        parse_mode='HTML'
+    )
+
+
+async def admin_delete_channel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kanalni o'chirish callback"""
+    query = update.callback_query
+    if not db.is_admin(query.from_user.id, ADMINS):
+        return
+
+    channel_db_id = int(query.data.replace("del_channel_", ""))
+    db.delete_channel_by_id(channel_db_id)
+    try:
+        await query.answer("Kanal o'chirildi")
+    except Exception:
+        pass
+
+    _sub_cache.clear()
+
+    channels = db.get_channels_from_db()
+    if not channels:
+        await query.edit_message_text(
+            text="✅ <b>Kanal o'chirildi. Hozirda kanallar qolmadi.</b>",
+            reply_markup=get_channels_manage_keyboard([]),
+            parse_mode='HTML'
+        )
+    else:
+        await query.edit_message_text(
+            text="✅ <b>Kanal muvaffaqiyatli o'chirildi!</b>\n\nQolgan kanallar ro'yxati:",
+            reply_markup=get_channels_manage_keyboard(channels),
+            parse_mode='HTML'
+        )
+
 
 async def start_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kanal qo'shishni boshlash"""
@@ -2364,7 +3076,7 @@ async def start_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     except Exception:
         pass
-    if query.from_user.id not in ADMINS:
+    if not db.is_admin(query.from_user.id, ADMINS):
         return ConversationHandler.END
 
     await query.edit_message_text(
@@ -2399,6 +3111,7 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if name and ch_id and link:
         success = db.add_channel(name, ch_id, link)
+        _sub_cache.clear()
         if success:
             await update.message.reply_html(
                 f"✅ <b>Kanal muvaffaqiyatli qo'shildi!</b>\n\n"
@@ -2416,6 +3129,26 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Amalni bekor qilish"""
+    user_id = update.effective_user.id
+    sess = get_user_session(user_id)
+    if sess.get('waiting_for_password') or sess.get('items'):
+        user_dir = sess.get('user_dir') or get_user_dir(DOCUMENTS_DIR, user_id)
+        cleanup_user_files(user_dir)
+        reset_user_session(user_id)
+        await update.message.reply_html("❌ <b>Amal bekor qilindi va fayllar tozalandi.</b>")
+        return ConversationHandler.END
+
+    context.user_data.clear()
+    is_adm = db.is_admin(user_id, ADMINS)
+    await update.message.reply_html(
+        "❌ <b>Amal bekor qilindi.</b>",
+        reply_markup=get_admin_main_keyboard() if is_adm else None
+    )
+    return ConversationHandler.END
+
+
 # =========================================================================
 # ASOSIY ILOVANI ISHGA TUSHIRISH
 # =========================================================================
@@ -2423,7 +3156,7 @@ async def receive_channel_link(update: Update, context: ContextTypes.DEFAULT_TYP
 def main():
     """Botni boshlash funksiyasi"""
     logger.info("Bot ishga tushirilmoqda...")
-    
+
     # Startupda eski fayllarni tozalash
     cleanup_old_files(DOCUMENTS_DIR, max_age_seconds=1800)
 
@@ -2455,20 +3188,78 @@ def main():
     # Xatoliklarni global ushlash
     application.add_error_handler(global_error_handler)
 
+    # 0. Telegram bloklaganlarni / qayta yoqqanlarni kuzatish (my_chat_member)
+    application.add_handler(ChatMemberHandler(chat_member_update_handler, ChatMemberHandler.MY_CHAT_MEMBER))
+
     # 1. Admin Broadcast Conversation
     broadcast_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_broadcast, pattern="^admin_broadcast$")],
         states={
             ADMIN_BROADCAST_STATE: [
-                MessageHandler(filters.ALL & ~filters.COMMAND, execute_broadcast)
+                MessageHandler(filters.ALL & ~filters.COMMAND, receive_broadcast_message)
+            ],
+            ADMIN_BROADCAST_CONFIRM: [
+                CallbackQueryHandler(toggle_broadcast_pin, pattern="^toggle_broadcast_pin$"),
+                CallbackQueryHandler(execute_broadcast, pattern="^start_broadcast_now$")
             ]
         },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(admin_back_callback, pattern="^admin_back$")
+        ],
         per_message=False
     )
     application.add_handler(broadcast_conv)
 
-    # 2. Admin Add Channel Conversation
+    # 2. Admin User Search Conversation
+    search_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_search_user, pattern="^admin_search_user$")],
+        states={
+            ADMIN_SEARCH_STATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_search_query)
+            ]
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(admin_back_callback, pattern="^admin_back$")
+        ],
+        per_message=False
+    )
+    application.add_handler(search_conv)
+
+    # 3. Admin DM Conversation
+    dm_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_dm_user, pattern="^dm_(\\d+)$")],
+        states={
+            ADMIN_DM_STATE: [
+                MessageHandler(filters.ALL & ~filters.COMMAND, send_dm_message)
+            ]
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(admin_back_callback, pattern="^admin_back$")
+        ],
+        per_message=False
+    )
+    application.add_handler(dm_conv)
+
+    # 4. Admin Add Sub-Admin Conversation
+    add_subadmin_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_add_subadmin, pattern="^admin_add_subadmin$")],
+        states={
+            ADMIN_ADD_SUBADMIN_STATE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_subadmin_id)
+            ]
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(admin_back_callback, pattern="^admin_back$")
+        ],
+        per_message=False
+    )
+    application.add_handler(add_subadmin_conv)
+
+    # 5. Admin Add Channel Conversation
     add_channel_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(start_add_channel, pattern="^admin_add_channel$")],
         states={
@@ -2476,7 +3267,10 @@ def main():
             ADMIN_ADD_CH_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_channel_id)],
             ADMIN_ADD_CH_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_channel_link)],
         },
-        fallbacks=[CommandHandler("cancel", cancel_command)],
+        fallbacks=[
+            CommandHandler("cancel", cancel_command),
+            CallbackQueryHandler(admin_back_callback, pattern="^admin_back$")
+        ],
         per_message=False
     )
     application.add_handler(add_channel_conv)
@@ -2492,7 +3286,7 @@ def main():
     # Matnli xabarlarni qabul qilish (Arxiv paroli va boshqalar)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_messages))
 
-    # Callback Query Handlers
+    # Callback Query Handlers - Asosiy Foydalanuvchi Amallari
     application.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
     application.add_handler(CallbackQueryHandler(make_pdf_callback, pattern="^action_make_pdf$"))
     application.add_handler(CallbackQueryHandler(make_pdf_to_images_callback, pattern="^action_pdf_to_images$"))
@@ -2512,10 +3306,21 @@ def main():
     # Admin Callback Handlers
     application.add_handler(CallbackQueryHandler(admin_back_callback, pattern="^admin_back$"))
     application.add_handler(CallbackQueryHandler(admin_stats_callback, pattern="^admin_stats$"))
-    application.add_handler(CallbackQueryHandler(admin_list_channels_callback, pattern="^admin_list_channels$"))
-    application.add_handler(CallbackQueryHandler(admin_delete_channel_callback, pattern="^del_channel_"))
+    application.add_handler(CallbackQueryHandler(admin_export_menu_callback, pattern="^admin_export$"))
+    application.add_handler(CallbackQueryHandler(admin_export_xlsx_callback, pattern="^admin_export_xlsx$"))
     application.add_handler(CallbackQueryHandler(admin_backup_db_callback, pattern="^admin_backup_db$"))
-    application.add_handler(CallbackQueryHandler(admin_backup_xlsx_callback, pattern="^admin_backup_xlsx$"))
+    application.add_handler(CallbackQueryHandler(admin_export_csv_callback, pattern="^admin_export_csv$"))
+    application.add_handler(CallbackQueryHandler(admin_maintenance_callback, pattern="^admin_maintenance$"))
+    application.add_handler(CallbackQueryHandler(toggle_maintenance_callback, pattern="^toggle_maintenance$"))
+    application.add_handler(CallbackQueryHandler(admin_subadmins_callback, pattern="^admin_subadmins$"))
+    application.add_handler(CallbackQueryHandler(del_subadmin_callback, pattern="^del_subadmin_(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(user_profile_by_id_callback, pattern="^user_search_id_(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(ban_user_callback, pattern="^ban_(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(unban_user_callback, pattern="^unban_(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(vip_user_callback, pattern="^vip_(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(unvip_user_callback, pattern="^unvip_(\\d+)$"))
+    application.add_handler(CallbackQueryHandler(admin_list_channels_callback, pattern="^admin_channels$"))
+    application.add_handler(CallbackQueryHandler(admin_delete_channel_callback, pattern="^del_channel_(\\d+)$"))
 
     logger.info("Bot muvaffaqiyatli ishga tushdi va xabarlarni kutmoqda.")
     application.run_polling(

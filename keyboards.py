@@ -81,16 +81,87 @@ def get_admin_main_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 Bot statistikasi", callback_data="admin_stats"),
-            InlineKeyboardButton("📤 Xabar yuborish", callback_data="admin_broadcast")
+            InlineKeyboardButton("🔍 Foydalanuvchi qidirish", callback_data="admin_search_user")
         ],
         [
-            InlineKeyboardButton("➕ Kanal qo'shish", callback_data="admin_add_channel"),
-            InlineKeyboardButton("📋 Kanallar ro'yxati", callback_data="admin_list_channels")
+            InlineKeyboardButton("🚀 Xabar tarqatish", callback_data="admin_broadcast"),
+            InlineKeyboardButton("📢 Majburiy kanallar", callback_data="admin_channels")
         ],
         [
-            InlineKeyboardButton("💾 SQLite (.db)", callback_data="admin_backup_db"),
-            InlineKeyboardButton("📑 Excel (.xlsx)", callback_data="admin_backup_xlsx")
+            InlineKeyboardButton("📁 Baza eksporti", callback_data="admin_export"),
+            InlineKeyboardButton("🛠 Texnik rejim", callback_data="admin_maintenance")
+        ],
+        [
+            InlineKeyboardButton("👑 Sub-Adminlar", callback_data="admin_subadmins"),
+            InlineKeyboardButton("🔄 Yangilash", callback_data="admin_back")
         ]
+    ])
+
+def get_admin_export_keyboard() -> InlineKeyboardMarkup:
+    """Baza eksport formatlari menyusi"""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Excel (.xlsx)", callback_data="admin_export_xlsx"),
+            InlineKeyboardButton("💾 SQLite (.sqlite)", callback_data="admin_backup_db")
+        ],
+        [
+            InlineKeyboardButton("📄 CSV (.csv)", callback_data="admin_export_csv")
+        ],
+        [
+            InlineKeyboardButton("◀️ Ortga", callback_data="admin_back")
+        ]
+    ])
+
+def get_user_manage_keyboard(user_id: int, is_banned: bool, is_vip: bool) -> InlineKeyboardMarkup:
+    """Foydalanuvchi kartasi boshqaruv tugmalari"""
+    ban_text = "✅ Blokdan chiqarish" if is_banned else "🚫 Bloklash (Ban)"
+    ban_action = f"unban_{user_id}" if is_banned else f"ban_{user_id}"
+
+    vip_text = "⭐️ VIP ni olish" if is_vip else "⭐️ VIP berish"
+    vip_action = f"unvip_{user_id}" if is_vip else f"vip_{user_id}"
+
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(ban_text, callback_data=ban_action),
+            InlineKeyboardButton(vip_text, callback_data=vip_action)
+        ],
+        [
+            InlineKeyboardButton("✉️ Xabar yuborish (DM)", callback_data=f"dm_{user_id}")
+        ],
+        [
+            InlineKeyboardButton("◀️ Ortga", callback_data="admin_back")
+        ]
+    ])
+
+def get_maintenance_keyboard(is_maint: bool) -> InlineKeyboardMarkup:
+    """Texnik rejim tugmasi"""
+    toggle_text = "🟢 Texnik rejimni O'CHIRISH" if is_maint else "🔴 Texnik rejimni YOQISH"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(toggle_text, callback_data="toggle_maintenance")],
+        [InlineKeyboardButton("◀️ Ortga", callback_data="admin_back")]
+    ])
+
+def get_sub_admins_keyboard(sub_admins: list) -> InlineKeyboardMarkup:
+    """Sub-adminlar boshqaruvi"""
+    buttons = []
+    for adm_id in sub_admins:
+        buttons.append([
+            InlineKeyboardButton(f"👤 Admin: {adm_id}", callback_data=f"user_search_id_{adm_id}"),
+            InlineKeyboardButton("❌ O'chirish", callback_data=f"del_subadmin_{adm_id}")
+        ])
+    buttons.append([
+        InlineKeyboardButton("➕ Admin qo'shish", callback_data="admin_add_subadmin"),
+        InlineKeyboardButton("◀️ Ortga", callback_data="admin_back")
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+def get_broadcast_confirm_keyboard(pin: bool) -> InlineKeyboardMarkup:
+    """Xabar tarqatishni tasdiqlash menyusi"""
+    pin_text = "📌 Qadash: [YOQILGAN]" if pin else "📌 Qadash: [O'CHIRILGAN]"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(pin_text, callback_data="toggle_broadcast_pin")],
+        [InlineKeyboardButton("🚀 YUBORISHNI BOSHLASH", callback_data="start_broadcast_now")],
+        [InlineKeyboardButton("❌ Bekor qilish", callback_data="admin_back")]
     ])
 
 def get_back_keyboard(callback_data: str = "admin_back") -> InlineKeyboardMarkup:
@@ -110,5 +181,8 @@ def get_channels_manage_keyboard(channels: list) -> InlineKeyboardMarkup:
             InlineKeyboardButton("❌ O'chirish", callback_data=f"del_channel_{db_id}")
         ])
     
-    buttons.append([InlineKeyboardButton("◀️ Ortga", callback_data="admin_back")])
+    buttons.append([
+        InlineKeyboardButton("➕ Kanal qo'shish", callback_data="admin_add_channel"),
+        InlineKeyboardButton("◀️ Ortga", callback_data="admin_back")
+    ])
     return InlineKeyboardMarkup(buttons)

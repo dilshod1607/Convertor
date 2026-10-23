@@ -1,47 +1,107 @@
+import os
+import csv
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
-import os
 import xlsxwriter as xl
 
 logger = logging.getLogger(__name__)
+TASHKENT_TZ = pytz.timezone('Asia/Tashkent')
+
 
 class Database:
     """
-    SQLite ma'lumotlar bazasi bilan xavfsiz va tezkor ishlash klassi.
-    Eski va yangi baza strukturalarini avtomatik moslashtiradi (Auto-migration).
+    Universal SQLite ma'lumotlar bazasi boshqaruvi.
+    WAL rejimi, 30 soniyalik busy_timeout va xavfsiz avtomatik migratsiya (Auto-migration)
+    bilan jihozlangan. 'database is locked' xatolarini to'liq oldini oladi.
     """
+
     def __init__(self, path_to_db: str = "database.db"):
         self.path_to_db = path_to_db
+        db_dir = os.path.dirname(self.path_to_db)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         self._init_db()
 
     def _get_connection(self):
-        return sqlite3.connect(self.path_to_db, timeout=20)
+        conn = sqlite3.connect(self.path_to_db, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=30000;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return conn
 
     def _init_db(self):
-        """Baza jadvallarini avtomatik yaratish va tuzilmani yangilash"""
+        """Baza jadvallarini avtomatik yaratish va mavjud bazani yangilash (Auto-migration)"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                
+
                 # 1. Foydalanuvchilar jadvali
                 cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     full_name TEXT,
                     username TEXT,
+                    language TEXT DEFAULT 'uz',
+                    created_at TEXT,
+                    last_active TEXT,
+                    is_active INTEGER DEFAULT 1,
+                    is_banned INTEGER DEFAULT 0,
+                    is_vip INTEGER DEFAULT 0,
+                    vip_expires_at TEXT
+                );
+                """)
+
+                # Avtomatik migratsiya: agar eski ustunlar yetishmasa qo'shamiz
+                cursor.execute("PRAGMA table_info(users)")
+                existing_cols = [c[1] for c in cursor.fetchall()]
+                new_columns = {
+                    'language': "TEXT DEFAULT 'uz'",
+                    'created_at': "TEXT",
+                    'last_active': "TEXT",
+                    'is_active': "INTEGER DEFAULT 1",
+                    'is_banned': "INTEGER DEFAULT 0",
+                    'is_vip': "INTEGER DEFAULT 0",
+                    'vip_expires_at': "TEXT"
+                }
+                for col_name, col_type in new_columns.items():
+                    if col_name not in existing_cols:
+                        try:
+                            cursor.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_type};")
+                            logger.info(f"[Migration] 'users' jadvaliga '{col_name}' ustuni qo'shildi.")
+                        except Exception as e:
+                            logger.warning(f"Migratsiya ogohlantirish ({col_name}): {e}")
+
+                # 2. Homiylik kanallari jadvali
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS channels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    channel_id TEXT NOT NULL UNIQUE,
+                    link TEXT NOT NULL,
                     created_at TEXT
                 );
                 """)
-                
-                # Agar eski bazada created_at ustuni bo'lmasa qo'shamiz (Migration)
-                cursor.execute("PRAGMA table_info(users)")
-                columns = [c[1] for c in cursor.fetchall()]
-                if 'created_at' not in columns:
-                    cursor.execute("ALTER TABLE users ADD COLUMN created_at TEXT")
 
-                # 2. Holat / Statistika jadvali
+                # 3. Yordamchi adminlar (Sub-Admins) jadvali
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sub_admins (
+                    user_id INTEGER PRIMARY KEY,
+                    added_by INTEGER,
+                    created_at TEXT
+                );
+                """)
+
+                # 4. Tizim sozlamalari (Texnik rejim va boshqalar)
+                cursor.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );
+                """)
+
+                # 5. Eski status jadvali (moslashuvchanlik uchun)
                 cursor.execute("""
                 CREATE TABLE IF NOT EXISTS status (
                     active INTEGER DEFAULT 0,
@@ -52,110 +112,231 @@ class Database:
                 if cursor.fetchone()[0] == 0:
                     cursor.execute("INSERT INTO status (active, block) VALUES (0, 0)")
 
-                # 3. Homiylik kanallari jadvali
-                cursor.execute("""
-                CREATE TABLE IF NOT EXISTS channels (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    channel_id TEXT NOT NULL UNIQUE,
-                    link TEXT NOT NULL
-                );
-                """)
                 conn.commit()
+                logger.info("Ma'lumotlar bazasi jadvallari muvaffaqiyatli tekshirildi.")
         except sqlite3.Error as e:
-            logger.error(f"Database initialization error: {e}")
+            logger.error(f"Database initialization error: {e}", exc_info=True)
 
-    def add_user(self, user_id: int, full_name: str, username: str = "") -> bool:
-        """Yangi foydalanuvchini bazaga qo'shish yoki yangilash"""
-        now = datetime.now(pytz.timezone('Asia/Tashkent')).strftime("%Y-%m-%d %H:%M:%S")
+    # =========================================================================
+    # FOYDALANUVCHILAR BILAN ISHLASH
+    # =========================================================================
+
+    def add_user(self, user_id: int, full_name: str, username: str = "", language: str = 'uz') -> bool:
+        """Yangi foydalanuvchini qo'shish yoki oxirgi faolligini yangilash"""
+        now = datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d %H:%M:%S")
         sql = """
-        INSERT INTO users (user_id, full_name, username, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO users (user_id, full_name, username, language, created_at, last_active, is_active)
+        VALUES (?, ?, ?, ?, ?, ?, 1)
         ON CONFLICT(user_id) DO UPDATE SET
             full_name = excluded.full_name,
-            username = excluded.username;
+            username = excluded.username,
+            last_active = excluded.last_active,
+            is_active = 1;
         """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(sql, (user_id, full_name or "", username or "", now))
+                cursor.execute(sql, (user_id, full_name or "", username or "", language or 'uz', now, now))
                 conn.commit()
                 return True
         except sqlite3.Error as e:
             logger.error(f"Error adding user {user_id}: {e}")
             return False
 
-    def select_user(self, user_id: int):
-        """Foydalanuvchi ma'lumotlarini olish"""
+    def set_user_active(self, user_id: int, is_active: int):
+        """Foydalanuvchi botni bloklaganida (0) yoki qayta yoqqanida (1) yangilash"""
+        now = datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d %H:%M:%S")
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT user_id, full_name, username FROM users WHERE user_id = ?", (user_id,))
-                return cursor.fetchone()
+                cursor.execute("UPDATE users SET is_active = ?, last_active = ? WHERE user_id = ?;", (is_active, now, user_id))
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error setting user active {user_id}: {e}")
+
+    def set_user_banned(self, user_id: int, is_banned: int):
+        """Admin tomonidan foydalanuvchini bloklash (1) yoki blokdan chiqarish (0)"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET is_banned = ? WHERE user_id = ?;", (is_banned, user_id))
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error setting user banned {user_id}: {e}")
+
+    def set_user_vip(self, user_id: int, is_vip: int, expires_at: str = None):
+        """Foydalanuvchiga VIP maqomini berish yoki bekor qilish"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE users SET is_vip = ?, vip_expires_at = ? WHERE user_id = ?;", (is_vip, expires_at, user_id))
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error setting user VIP {user_id}: {e}")
+
+    def select_user(self, user_id: int):
+        """Foydalanuvchi ma'lumotlarini dict ko'rinishida olish"""
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM users WHERE user_id = ?;", (user_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
         except sqlite3.Error as e:
             logger.error(f"Error selecting user {user_id}: {e}")
             return None
 
+    def search_user(self, query: str):
+        """Foydalanuvchini Telegram ID yoki @username bo'yicha qidirish"""
+        cleaned = query.strip()
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                if cleaned.isdigit():
+                    cursor.execute("SELECT * FROM users WHERE user_id = ?;", (int(cleaned),))
+                else:
+                    uname = cleaned.lstrip('@')
+                    cursor.execute("SELECT * FROM users WHERE LOWER(username) = LOWER(?);", (uname,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except sqlite3.Error as e:
+            logger.error(f"Error searching user {query}: {e}")
+            return None
+
     def count_users(self) -> int:
-        """Jami foydalanuvchilar sonini aniq butun son (int) sifatida qaytaradi"""
+        """Jami foydalanuvchilar soni"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM users")
+                cursor.execute("SELECT COUNT(*) FROM users;")
                 res = cursor.fetchone()
                 return res[0] if res else 0
         except sqlite3.Error as e:
             logger.error(f"Error counting users: {e}")
             return 0
 
-    def select_all_users(self):
-        """Barcha foydalanuvchilar ro'yxatini olish"""
+    def get_detailed_stats(self) -> dict:
+        """Shaffof va to'liq statistika hisoboti"""
+        now = datetime.now(TASHKENT_TZ)
+        today_start = now.strftime("%Y-%m-%d 00:00:00")
+        day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+        week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT user_id, full_name, username, created_at FROM users")
+
+                cursor.execute("SELECT COUNT(*) FROM users;")
+                total = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 1;")
+                active = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 0;")
+                blocked = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1;")
+                banned = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM users WHERE is_vip = 1;")
+                vip = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM users WHERE created_at >= ?;", (today_start,))
+                today = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?;", (day_ago,))
+                active_24h = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM users WHERE last_active >= ?;", (week_ago,))
+                active_7d = cursor.fetchone()[0]
+
+                cursor.execute("SELECT COUNT(*) FROM channels;")
+                channels_cnt = cursor.fetchone()[0]
+
+                return {
+                    "total": total,
+                    "active": active,
+                    "blocked": blocked,
+                    "banned": banned,
+                    "vip": vip,
+                    "today": today,
+                    "active_24h": active_24h,
+                    "active_7d": active_7d,
+                    "channels_cnt": channels_cnt
+                }
+        except sqlite3.Error as e:
+            logger.error(f"Error getting detailed stats: {e}")
+            return {
+                "total": 0, "active": 0, "blocked": 0, "banned": 0, "vip": 0,
+                "today": 0, "active_24h": 0, "active_7d": 0, "channels_cnt": 0
+            }
+
+    def select_all_users(self):
+        """Eski uslubda barcha a'zolarni olish (moslashuvchanlik uchun)"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id, full_name, username, created_at FROM users;")
                 return cursor.fetchall()
         except sqlite3.Error as e:
             logger.error(f"Error selecting all users: {e}")
             return []
 
-    def get_status(self):
-        """Aktiv va bloklangan foydalanuvchilar sonini olish"""
+    def select_active_user_ids(self) -> list:
+        """Xabar tarqatish (broadcast) uchun faol a'zolar ID lari"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT active, block FROM status LIMIT 1")
-                res = cursor.fetchone()
-                if res:
-                    return res[0], res[1]
-                return 0, 0
+                cursor.execute("SELECT user_id FROM users WHERE is_active = 1 AND is_banned = 0;")
+                rows = cursor.fetchall()
+                return [r[0] for r in rows]
+        except sqlite3.Error as e:
+            logger.error(f"Error selecting active user ids: {e}")
+            return []
+
+    def get_status(self):
+        """Aktiv va bloklangan foydalanuvchilar soni (eski status jadvalidan)"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 1;")
+                act = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM users WHERE is_active = 0;")
+                blk = cursor.fetchone()[0]
+                return act, blk
         except sqlite3.Error as e:
             logger.error(f"Error getting status: {e}")
             return 0, 0
 
     def update_status(self, active: int, block: int):
-        """Aktiv va blok statistikani yangilash"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("UPDATE status SET active = ?, block = ?", (active, block))
+                cursor.execute("UPDATE status SET active = ?, block = ?;", (active, block))
                 conn.commit()
         except sqlite3.Error as e:
             logger.error(f"Error updating status: {e}")
 
+    # =========================================================================
+    # MAJBURIY OBUNA KANALLARI BILAN ISHLASH
+    # =========================================================================
+
     def add_channel(self, name: str, channel_id: str, link: str) -> bool:
-        """Yangi majburiy a'zolik kanalini qo'shish"""
-        sql = "INSERT INTO channels (name, channel_id, link) VALUES (?, ?, ?)"
+        """Yangi homiy kanalini qo'shish"""
+        now = datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        sql = "INSERT INTO channels (name, channel_id, link, created_at) VALUES (?, ?, ?, ?);"
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute(sql, (name.strip(), channel_id.strip(), link.strip()))
+                cursor.execute(sql, (name.strip(), str(channel_id).strip(), link.strip(), now))
                 conn.commit()
                 return True
         except sqlite3.IntegrityError:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("UPDATE channels SET name = ?, link = ? WHERE channel_id = ?", (name.strip(), link.strip(), channel_id.strip()))
+                cursor.execute("UPDATE channels SET name = ?, link = ? WHERE channel_id = ?;", (name.strip(), link.strip(), str(channel_id).strip()))
                 conn.commit()
                 return True
         except sqlite3.Error as e:
@@ -167,65 +348,219 @@ class Database:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT name, channel_id, link, id FROM channels")
+                cursor.execute("SELECT name, channel_id, link, id FROM channels ORDER BY id ASC;")
                 return cursor.fetchall()
         except sqlite3.Error as e:
             logger.error(f"Error fetching channels: {e}")
             return []
 
     def delete_channel_by_id(self, channel_db_id: int) -> bool:
-        """Kanalni IDsi bo'yicha o'chirish"""
+        """Kanalni ID si bo'yicha o'chirish"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM channels WHERE id = ?", (channel_db_id,))
+                cursor.execute("DELETE FROM channels WHERE id = ?;", (channel_db_id,))
                 conn.commit()
                 return cursor.rowcount > 0
         except sqlite3.Error as e:
             logger.error(f"Error deleting channel {channel_db_id}: {e}")
             return False
 
-    def export_users_to_excel(self, output_path: str = "users.xlsx") -> str:
-        """Foydalanuvchilar ro'yxatini chiroyli Excel faylga eksport qilish"""
-        users = self.select_all_users()
-        workbook = xl.Workbook(output_path)
-        worksheet = workbook.add_worksheet("Foydalanuvchilar")
+    def delete_channel_by_channel_id(self, channel_id: str) -> bool:
+        """Kanalni Telegram channel_id si bo'yicha o'chirish"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM channels WHERE channel_id = ?;", (str(channel_id).strip(),))
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Error deleting channel by channel_id {channel_id}: {e}")
+            return False
 
-        header_format = workbook.add_format({
-            'bold': True,
-            'align': 'center',
-            'valign': 'vcenter',
-            'fg_color': '#3b82f6',
-            'font_color': '#ffffff',
-            'border': 1
-        })
-        cell_format = workbook.add_format({'align': 'left', 'valign': 'vcenter', 'border': 1})
-        num_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1})
+    # =========================================================================
+    # SUB-ADMINLAR (YORDAMCHI ADMINLAR)
+    # =========================================================================
 
-        worksheet.set_column('A:A', 8)
-        worksheet.set_column('B:B', 18)
-        worksheet.set_column('C:C', 30)
-        worksheet.set_column('D:D', 22)
-        worksheet.set_column('E:E', 22)
+    def add_sub_admin(self, user_id: int, added_by: int) -> bool:
+        now = datetime.now(TASHKENT_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO sub_admins (user_id, added_by, created_at) VALUES (?, ?, ?);", (user_id, added_by, now))
+                conn.commit()
+                return True
+        except sqlite3.IntegrityError:
+            return False
+        except sqlite3.Error as e:
+            logger.error(f"Error adding sub-admin {user_id}: {e}")
+            return False
 
-        worksheet.write('A1', 'T/r', header_format)
-        worksheet.write('B1', 'User ID', header_format)
-        worksheet.write('C1', 'F.I.SH / Ism', header_format)
-        worksheet.write('D1', 'Username', header_format)
-        worksheet.write('E1', "Qo'shilgan sana", header_format)
+    def delete_sub_admin(self, user_id: int) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM sub_admins WHERE user_id = ?;", (user_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+        except sqlite3.Error as e:
+            logger.error(f"Error deleting sub-admin {user_id}: {e}")
+            return False
 
-        for idx, user in enumerate(users, start=1):
-            row = idx + 1
-            user_id = user[0]
-            fullname = user[1] if len(user) > 1 else ""
-            username = f"@{user[2]}" if len(user) > 2 and user[2] else "-"
-            created_at = user[3] if len(user) > 3 and user[3] else "-"
+    def get_sub_admins(self) -> list:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT user_id FROM sub_admins;")
+                return [r[0] for r in cursor.fetchall()]
+        except sqlite3.Error as e:
+            logger.error(f"Error getting sub-admins: {e}")
+            return []
 
-            worksheet.write(f'A{row}', idx, num_format)
-            worksheet.write(f'B{row}', user_id, num_format)
-            worksheet.write(f'C{row}', fullname, cell_format)
-            worksheet.write(f'D{row}', username, cell_format)
-            worksheet.write(f'E{row}', created_at, num_format)
+    def is_admin(self, user_id: int, main_admins: list) -> bool:
+        if user_id in main_admins:
+            return True
+        sub_admins = self.get_sub_admins()
+        return user_id in sub_admins
 
-        workbook.close()
-        return output_path
+    # =========================================================================
+    # TIZIM SOZLAMALARI VA TEXNIK REJIM (MAINTENANCE)
+    # =========================================================================
+
+    def get_setting(self, key: str, default: str = None) -> str:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM settings WHERE key = ?;", (key,))
+                row = cursor.fetchone()
+                return row[0] if row else default
+        except sqlite3.Error:
+            return default
+
+    def set_setting(self, key: str, value: str):
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                INSERT INTO settings (key, value) VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+                """, (key, value))
+                conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Error setting {key}: {e}")
+
+    def is_maintenance(self) -> bool:
+        return self.get_setting("maintenance_mode", "0") == "1"
+
+    def set_maintenance(self, enabled: bool):
+        self.set_setting("maintenance_mode", "1" if enabled else "0")
+
+    # =========================================================================
+    # EKSPORT (EXCEL & CSV)
+    # =========================================================================
+
+    def export_users_to_excel(self, output_path: str = "users_export.xlsx") -> str:
+        """Foydalanuvchilar ro'yxatini to'liq stillangan, professional Excel jadvaliga aylantirish"""
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM users ORDER BY created_at DESC;")
+                users = cursor.fetchall()
+
+            workbook = xl.Workbook(output_path)
+            worksheet = workbook.add_worksheet("Foydalanuvchilar")
+            worksheet.freeze_panes(1, 0)
+
+            # Sarlavha stili (To'q-ko'k fon, oq qalin matn)
+            header_format = workbook.add_format({
+                'bold': True,
+                'align': 'center',
+                'valign': 'vcenter',
+                'bg_color': '#1B365D',
+                'font_color': '#FFFFFF',
+                'border': 1,
+                'font_size': 11
+            })
+
+            center_format = workbook.add_format({'align': 'center', 'valign': 'vcenter', 'border': 1})
+            left_format = workbook.add_format({'align': 'left', 'valign': 'vcenter', 'border': 1})
+
+            # Rangli Badge stillari
+            active_badge = workbook.add_format({'bg_color': '#D4EDDA', 'font_color': '#155724', 'align': 'center', 'border': 1, 'bold': True})
+            blocked_badge = workbook.add_format({'bg_color': '#FFF3CD', 'font_color': '#856404', 'align': 'center', 'border': 1})
+            banned_badge = workbook.add_format({'bg_color': '#F8D7DA', 'font_color': '#721C24', 'align': 'center', 'border': 1, 'bold': True})
+            vip_badge = workbook.add_format({'bg_color': '#E2D9F3', 'font_color': '#553C9A', 'align': 'center', 'border': 1, 'bold': True})
+
+            headers = ["№", "User ID", "To'liq Ism", "Username", "Til", "Ro'yxatdan o'tgan", "Oxirgi faollik", "Holati", "Maqomi"]
+            for col_idx, h in enumerate(headers):
+                worksheet.write(0, col_idx, h, header_format)
+
+            for row_idx, u in enumerate(users, start=1):
+                worksheet.write(row_idx, 0, row_idx, center_format)
+                worksheet.write(row_idx, 1, u["user_id"], center_format)
+                worksheet.write(row_idx, 2, u["full_name"] or "", left_format)
+                worksheet.write(row_idx, 3, f"@{u['username']}" if u["username"] else "-", left_format)
+                worksheet.write(row_idx, 4, u["language"] if "language" in u.keys() and u["language"] else "uz", center_format)
+                worksheet.write(row_idx, 5, u["created_at"] or "-", center_format)
+                worksheet.write(row_idx, 6, u["last_active"] or "-", center_format)
+
+                is_banned = u["is_banned"] if "is_banned" in u.keys() else 0
+                is_active = u["is_active"] if "is_active" in u.keys() else 1
+                is_vip = u["is_vip"] if "is_vip" in u.keys() else 0
+
+                if is_banned == 1:
+                    worksheet.write(row_idx, 7, "🚫 Ban", banned_badge)
+                elif is_active == 1:
+                    worksheet.write(row_idx, 7, "✅ Faol", active_badge)
+                else:
+                    worksheet.write(row_idx, 7, "⏸ Bloklagan", blocked_badge)
+
+                if is_vip == 1:
+                    worksheet.write(row_idx, 8, "⭐️ VIP", vip_badge)
+                else:
+                    worksheet.write(row_idx, 8, "Oddiy", center_format)
+
+            # Ustun kengliklari
+            worksheet.set_column(0, 0, 6)
+            worksheet.set_column(1, 1, 15)
+            worksheet.set_column(2, 2, 26)
+            worksheet.set_column(3, 3, 20)
+            worksheet.set_column(4, 4, 8)
+            worksheet.set_column(5, 6, 20)
+            worksheet.set_column(7, 8, 15)
+
+            workbook.close()
+            return output_path
+        except Exception as e:
+            logger.error(f"Error exporting to Excel: {e}", exc_info=True)
+            return output_path
+
+    def export_users_to_csv(self, output_path: str = "users_export.csv") -> str:
+        """Foydalanuvchilar ro'yxatini UTF-8 BOM bilan CSV ga eksport qilish"""
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM users ORDER BY created_at DESC;")
+                users = cursor.fetchall()
+
+            with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["User ID", "Full Name", "Username", "Language", "Created At", "Last Active", "Is Active", "Is Banned", "Is VIP"])
+                for u in users:
+                    writer.writerow([
+                        u["user_id"],
+                        u["full_name"] or "",
+                        u["username"] or "",
+                        u["language"] if "language" in u.keys() else "uz",
+                        u["created_at"] or "",
+                        u["last_active"] or "",
+                        u["is_active"] if "is_active" in u.keys() else 1,
+                        u["is_banned"] if "is_banned" in u.keys() else 0,
+                        u["is_vip"] if "is_vip" in u.keys() else 0
+                    ])
+            return output_path
+        except Exception as e:
+            logger.error(f"Error exporting to CSV: {e}")
+            return output_path
