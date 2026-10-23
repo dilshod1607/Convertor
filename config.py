@@ -29,6 +29,7 @@ WELCOME_MESSAGE = (
     "⚡️ <b>Botning barcha imkoniyatlari:</b>\n"
     "• 📄 <b>Rasmlar ➡️ PDF:</b> Rasmlarni sifatli bitta PDF hujjatga aylantirish;\n"
     "• 📑 <b>PDF Tools:</b> Bir nechta PDF larni birlashtirish, hajmini siqish (Compress) yoki sahifalarni foto-albom qilib ajratish;\n"
+    "• 🎙 <b>AI Audio Enhancer:</b> Ovoz va musiqalardagi shitirlash, shovqin va shamol tovushlarini tozalash (Adobe Speech Clean);\n"
     "• 🎵 <b>Media ➡️ MP3:</b> Video va audio fayllarni 192kbps HD MP3 ga o'tkazish;\n"
     "• 📝 <b>Matn ➡️ PDF:</b> Matnli va dastur kod fayllarini formatlangan PDF ga aylantirish;\n"
     "• 📂 <b>Universal Arxivator:</b> ZIP, RAR, 7Z, TAR arxivlarni ochish (parolli arxivlarni ham ochadi);\n"

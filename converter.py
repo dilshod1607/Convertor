@@ -76,6 +76,10 @@ try:
 except Exception:
     FFMPEG_PATH = shutil.which("ffmpeg")
 
+# Neyron tarmoq shovqin tozalash modellari (RNNoise / Adobe Enhance effekti)
+MODELS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+DEFAULT_RNNN_MODEL = os.path.join(MODELS_DIR, "cb.rnnn")
+
 def get_libreoffice_cmd() -> str:
     """LibreOffice / Soffice dasturini topish"""
     for cmd in ["libreoffice", "soffice"]:
@@ -723,6 +727,60 @@ def convert_media_to_mp3(media_path: str, output_mp3_path: str) -> bool:
         return os.path.exists(output_mp3_path)
     except Exception as e:
         logger.error(f"Media to MP3 conversion failed: {e}", exc_info=True)
+        return False
+    finally:
+        force_garbage_collection()
+
+
+def enhance_audio_voice(input_path: str, output_path: str) -> bool:
+    """
+    Audio yoki video ovozini Adobe Audio Enhancer kabi shovqin, shitirlash va
+    aks-sadolardan tozalab, studiya sifatidagi toza ovozga (192kbps MP3) aylantiradi.
+    """
+    if not os.path.exists(input_path) or not FFMPEG_PATH:
+        return False
+    try:
+        model_path = DEFAULT_RNNN_MODEL
+        if not os.path.exists(model_path):
+            alt_model = os.path.join(MODELS_DIR, "std.rnnn")
+            if os.path.exists(alt_model):
+                model_path = alt_model
+            else:
+                model_path = None
+
+        filter_parts = ["highpass=f=75"]
+        if model_path and os.path.exists(model_path):
+            try:
+                rel_m = os.path.relpath(os.path.abspath(model_path)).replace(os.sep, '/')
+            except Exception:
+                rel_m = model_path.replace(os.sep, '/')
+            filter_parts.append(f"arnndn=m={rel_m}:mix=1.0")
+
+        filter_parts.append("afftdn=nr=10:nf=-45")
+        filter_parts.append("equalizer=f=3000:width_type=h:width=1000:g=2.5")
+        filter_parts.append("dynaudnorm=p=0.95:m=10:s=12")
+
+        filter_chain = ",".join(filter_parts)
+
+        cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-i", input_path,
+            "-vn",
+            "-af", filter_chain,
+            "-acodec", "libmp3lame",
+            "-ab", "192k",
+            "-ar", "44100",
+            output_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        if res.returncode != 0:
+            err = res.stderr.decode('utf-8', errors='ignore')
+            logger.warning(f"FFmpeg audio enhance failed (code {res.returncode}): {err}")
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        logger.error(f"Audio enhancement failed: {e}", exc_info=True)
         return False
     finally:
         force_garbage_collection()

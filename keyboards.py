@@ -49,10 +49,12 @@ def get_file_action_keyboard(
 
     # 4. Audio / Video media bo'lsa
     if media_count > 0:
-        media_btns = [InlineKeyboardButton(f"🎵 MP3 ga aylantirish ({media_count} ta)", callback_data="action_media_to_mp3")]
+        buttons.append([
+            InlineKeyboardButton(f"🎵 MP3 ga aylantirish ({media_count} ta)", callback_data="action_media_to_mp3"),
+            InlineKeyboardButton(f"🎙 Ovozni tozalash (AI)", callback_data="action_enhance_audio")
+        ])
         if video_count > 0:
-            media_btns.append(InlineKeyboardButton("🎞 GIF qilish", callback_data="action_video_to_gif"))
-        buttons.append(media_btns)
+            buttons.append([InlineKeyboardButton("🎞 GIF qilish", callback_data="action_video_to_gif")])
 
     # 5. Matn / Kod fayllari bo'lsa
     if text_count > 0:
