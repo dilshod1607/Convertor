@@ -786,6 +786,48 @@ def enhance_audio_voice(input_path: str, output_path: str) -> bool:
         force_garbage_collection()
 
 
+def enhance_asmr_audio(input_path: str, output_path: str) -> bool:
+    """
+    Ruchka yozuvi, qalam shitirlashi, qog'oz ovozi va ASMR yozuvlarni
+    orqa fon shovqinini yumshoq tozalab, chertish va yozish tovushlarini
+    juda tiniq, yoqimli va baland (Crisp ASMR) qilib beradi.
+    """
+    if not os.path.exists(input_path) or not FFMPEG_PATH:
+        return False
+    try:
+        filter_chain = (
+            "highpass=f=60,"
+            "afftdn=nr=8:nf=-45:tn=1,"
+            "equalizer=f=4500:width_type=h:width=2500:g=6,"
+            "treble=g=5:f=6000,"
+            "crystalizer=i=2.5,"
+            "dynaudnorm=p=0.95:m=12:s=5:g=7"
+        )
+
+        cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-i", input_path,
+            "-vn",
+            "-af", filter_chain,
+            "-acodec", "libmp3lame",
+            "-ab", "192k",
+            "-ar", "44100",
+            output_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        if res.returncode != 0:
+            err = res.stderr.decode('utf-8', errors='ignore')
+            logger.warning(f"FFmpeg ASMR enhance failed (code {res.returncode}): {err}")
+            return False
+        return os.path.exists(output_path) and os.path.getsize(output_path) > 0
+    except Exception as e:
+        logger.error(f"ASMR audio enhancement failed: {e}", exc_info=True)
+        return False
+    finally:
+        force_garbage_collection()
+
+
 def convert_video_to_gif(video_path: str, output_gif_path: str, max_duration: int = 15) -> bool:
     """
     Videodan sifatli va ixcham animatsiyali GIF tayyorlaydi.

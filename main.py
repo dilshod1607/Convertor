@@ -53,6 +53,7 @@ from converter import (
     convert_text_to_pdf,
     convert_media_to_mp3,
     enhance_audio_voice,
+    enhance_asmr_audio,
     convert_video_to_gif,
     convert_office_to_pdf,
     extract_text_ocr,
@@ -1190,6 +1191,113 @@ async def enhance_audio_callback(update: Update, context: ContextTypes.DEFAULT_T
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"⚠️ <b>{orig_name}</b> faylidan ovozni tozalab bo'lmadi (ehtimol faylda audio yo'q yoki format qo'llab-quvvatlanmaydi).",
+                parse_mode='HTML'
+            )
+        await asyncio.sleep(0.3)
+
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
+
+    cleanup_user_files(user_dir)
+    reset_user_session(user_id)
+
+
+async def enhance_asmr_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ruchka yozuvi, qalam va ASMR tovushlarini kuchaytirib, tiniq ASMR audio yaratish"""
+    query = update.callback_query
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    user_id = query.from_user.id
+    sess = get_user_session(user_id)
+
+    media_items = [it for it in sess['items'] if it['type'] in ('media', 'video', 'audio')]
+    if not media_items:
+        await query.message.reply_text("❌ Audio yoki video fayl topilmadi!")
+        return
+
+    sess['menu_msg_id'] = None
+    initial_progress = build_progress_bar(
+        current=0,
+        total=len(media_items),
+        title="🎧 ASMR / Ruchka yozuvi tayyorlanmoqda...",
+        current_info="Fayllar yuklanmoqda..."
+    )
+    try:
+        await query.message.edit_text(initial_progress, parse_mode='HTML')
+        progress_msg = query.message
+    except Exception:
+        progress_msg = await query.message.reply_html(initial_progress)
+    user_dir = get_user_dir(DOCUMENTS_DIR, user_id)
+
+    # 1. Yuklab olish
+    media_paths = await _download_session_items(context.bot, media_items, user_dir, progress_msg)
+    if not media_paths:
+        await progress_msg.edit_text("❌ Fayllarni yuklab olishda xatolik yuz berdi.")
+        cleanup_user_files(user_dir)
+        reset_user_session(user_id)
+        return
+
+    # 2. ASMR Enhance qilish (Ruchka yozuvi, qalam shitirlashi, nozik teksturalarni chiqarish)
+    start_time = time.time()
+    loop = asyncio.get_running_loop()
+    bot_username = context.bot.username or "convertoral_bot"
+
+    for idx, (it, m_path) in enumerate(zip(media_items, media_paths), 1):
+        orig_name = it.get('file_name') or os.path.basename(m_path)
+        try:
+            await progress_msg.edit_text(
+                build_progress_bar(
+                    current=idx,
+                    total=len(media_paths),
+                    title="🎧 ASMR yozuv tiniqlashtirilmoqda...",
+                    current_info=orig_name,
+                    start_time=start_time
+                ),
+                parse_mode='HTML'
+            )
+        except Exception:
+            pass
+
+        output_asmr = os.path.join(user_dir, f"asmr_{idx}_{int(time.time())}.mp3")
+        async with CONVERT_SEMAPHORE:
+            success = await loop.run_in_executor(None, enhance_asmr_audio, m_path, output_asmr)
+
+        if success and os.path.exists(output_asmr) and os.path.getsize(output_asmr) > 0:
+            clean_name = orig_name
+            if "_" in clean_name and not it.get('file_name'):
+                clean_name = clean_name.split("_", 1)[1]
+            base_title = os.path.splitext(clean_name)[0]
+            if not base_title:
+                base_title = f"asmr_{idx}"
+
+            with open(output_asmr, 'rb') as audio_file:
+                await context.bot.send_audio(
+                    chat_id=user_id,
+                    audio=audio_file,
+                    title=f"{base_title} (ASMR Ruchka)",
+                    performer="🎧 ASMR Audio Enhancer",
+                    filename=f"{base_title}_asmr.mp3",
+                    caption=(
+                        f"🎧 <b>ASMR / Ruchka Yozuvi (Crisp Pen ASMR)</b>\n\n"
+                        f"✨ <b>Ruchka va qalam shitirlashi maksimal tiniqlashtirildi!</b>\n\n"
+                        f"📝 <b>Asl fayl:</b> <code>{orig_name}</code>\n"
+                        f"🎧 <b>Format:</b> 192 kbps HD Audio (ASMR Studio)\n"
+                        f"💾 <b>Hajmi:</b> {format_file_size(os.path.getsize(output_asmr))}\n"
+                        f"⚡️ <b>Filtrlar:</b> Yozuv teksturasi + Transient Sharpener + Yumshoq fon tozalash\n\n"
+                        f"🤖 @{bot_username}"
+                    ),
+                    parse_mode='HTML',
+                    read_timeout=120.0,
+                    write_timeout=120.0
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"⚠️ <b>{orig_name}</b> faylidan ASMR audio tayyorlab bo'lmadi.",
                 parse_mode='HTML'
             )
         await asyncio.sleep(0.3)
@@ -2395,6 +2503,7 @@ def main():
     application.add_handler(CallbackQueryHandler(text_to_pdf_callback, pattern="^action_text_to_pdf$"))
     application.add_handler(CallbackQueryHandler(media_to_mp3_callback, pattern="^action_media_to_mp3$"))
     application.add_handler(CallbackQueryHandler(enhance_audio_callback, pattern="^action_enhance_audio$"))
+    application.add_handler(CallbackQueryHandler(enhance_asmr_callback, pattern="^action_enhance_asmr$"))
     application.add_handler(CallbackQueryHandler(video_to_gif_callback, pattern="^action_video_to_gif$"))
     application.add_handler(CallbackQueryHandler(unzip_callback, pattern="^action_unzip$"))
     application.add_handler(CallbackQueryHandler(make_zip_callback, pattern="^action_make_zip$"))
