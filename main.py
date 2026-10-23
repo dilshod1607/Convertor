@@ -2953,17 +2953,27 @@ async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         else:
             db_size = f"{sz / 1024:.1f} KB"
 
+    total = stats.get('total', 0)
+    active = stats.get('active', 0)
+    blocked = stats.get('blocked', 0)
+    banned = stats.get('banned', 0)
+    vip = stats.get('vip', 0)
+    today = stats.get('today_joined', stats.get('today', 0))
+    active_24h = stats.get('active_24h', 0)
+    active_7d = stats.get('active_7d', 0)
+    channels_count = stats.get('channels_count', stats.get('channels_cnt', 0))
+
     text = (
         f"📊 <b>Convertor Bot — To'liq Statistika</b>\n\n"
-        f"👥 <b>Jami foydalanuvchilar:</b> {stats['total']:,} ta\n"
-        f"├ 🟢 <b>Faol a'zolar:</b> {stats['active']:,} ta\n"
-        f"├ ⏸ <b>Botni bloklaganlar:</b> {stats['blocked']:,} ta\n"
-        f"└ 🔴 <b>Admin bloklagan:</b> {stats['banned']:,} ta\n\n"
-        f"✨ <b>Bugun qo'shilganlar:</b> +{stats['today_joined']:,} ta\n"
-        f"⚡️ <b>24 soatda faol:</b> {stats['active_24h']:,} ta\n"
-        f"📅 <b>7 kunda faol:</b> {stats['active_7d']:,} ta\n\n"
-        f"⭐️ <b>VIP foydalanuvchilar:</b> {stats['vip']:,} ta\n"
-        f"📢 <b>Majburiy kanallar soni:</b> {stats['channels_count']} ta\n"
+        f"👥 <b>Jami foydalanuvchilar:</b> {total:,} ta\n"
+        f"├ 🟢 <b>Faol a'zolar:</b> {active:,} ta\n"
+        f"├ ⏸ <b>Botni bloklaganlar:</b> {blocked:,} ta\n"
+        f"└ 🔴 <b>Admin bloklagan:</b> {banned:,} ta\n\n"
+        f"✨ <b>Bugun qo'shilganlar:</b> +{today:,} ta\n"
+        f"⚡️ <b>24 soatda faol:</b> {active_24h:,} ta\n"
+        f"📅 <b>7 kunda faol:</b> {active_7d:,} ta\n\n"
+        f"⭐️ <b>VIP foydalanuvchilar:</b> {vip:,} ta\n"
+        f"📢 <b>Majburiy kanallar soni:</b> {channels_count} ta\n"
         f"💾 <b>Baza fayli hajmi:</b> {db_size}\n"
         f"────────────────────────\n"
         f"🕒 <i>Vaqt: {datetime.now(TASHKENT_TZ).strftime('%d.%m.%Y %H:%M:%S')}</i>"

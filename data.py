@@ -215,7 +215,7 @@ class Database:
                 cursor.execute("""
                     SELECT * FROM users 
                     WHERE is_vip = 1 AND (vip_expires_at IS NULL OR vip_expires_at > datetime('now'))
-                    ORDER BY id DESC;
+                    ORDER BY user_id DESC;
                 """)
                 return [dict(r) for r in cursor.fetchall()]
         except sqlite3.Error as e:
@@ -327,15 +327,18 @@ class Database:
                     "banned": banned,
                     "vip": vip,
                     "today": today,
+                    "today_joined": today,
                     "active_24h": active_24h,
                     "active_7d": active_7d,
-                    "channels_cnt": channels_cnt
+                    "channels_cnt": channels_cnt,
+                    "channels_count": channels_cnt
                 }
         except sqlite3.Error as e:
             logger.error(f"Error getting detailed stats: {e}")
             return {
                 "total": 0, "active": 0, "blocked": 0, "banned": 0, "vip": 0,
-                "today": 0, "active_24h": 0, "active_7d": 0, "channels_cnt": 0
+                "today": 0, "today_joined": 0, "active_24h": 0, "active_7d": 0,
+                "channels_cnt": 0, "channels_count": 0
             }
 
     def select_all_users(self):
