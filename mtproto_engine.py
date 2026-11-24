@@ -4,6 +4,15 @@ import time
 import logging
 import asyncio
 from typing import Optional, Callable
+from dotenv import load_dotenv
+
+# .env faylini yuklash
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+env_file = os.path.join(BASE_DIR, ".env")
+if os.path.exists(env_file):
+    load_dotenv(env_file)
+else:
+    load_dotenv()
 
 try:
     from telethon import TelegramClient, events
@@ -17,7 +26,7 @@ API_ID = int(os.getenv("API_ID", "22541448"))
 API_HASH = os.getenv("API_HASH", "8706b137c3cae93fa2e2629fee36addf")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-SESSION_NAME = "convertor_mtproto_session"
+SESSION_NAME = os.path.join(BASE_DIR, "convertor_mtproto_session")
 
 
 class MTProtoEngine:
@@ -33,19 +42,38 @@ class MTProtoEngine:
 
     async def start(self):
         """MTProto mijozini xavfsiz ishga tushirish"""
-        if self._is_started or not TelegramClient or not BOT_TOKEN:
+        if self._is_started and self.client and self.client.is_connected():
+            return
+        token = os.getenv("BOT_TOKEN", BOT_TOKEN)
+        if not TelegramClient or not token:
+            logger.warning("MTProto start bekori: TelegramClient yoki BOT_TOKEN topilmadi.")
             return
         async with self._lock:
-            if self._is_started:
+            if self._is_started and self.client and self.client.is_connected():
                 return
             try:
+                if self.client and not self.client.is_connected():
+                    try:
+                        await self.client.disconnect()
+                    except Exception:
+                        pass
                 self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-                await self.client.start(bot_token=BOT_TOKEN)
+                await self.client.start(bot_token=token)
                 self._is_started = True
                 logger.info("🟢 MTProto 2000 MB Dvigateli muvaffaqiyatli ishga tushdi.")
             except Exception as e:
                 logger.warning(f"⚠️ MTProto Dvigatelini ishga tushirishda ogohlantirish: {e}")
                 self.client = None
+                self._is_started = False
+
+    async def stop(self):
+        """MTProto mijozini to'xtatish"""
+        if self.client and self._is_started:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            self._is_started = False
 
     async def download_media(
         self,
@@ -57,10 +85,12 @@ class MTProtoEngine:
         """2000 MB gacha bo'lgan har qanday faylni yuklab olish"""
         await self.start()
         if not self.client or not self._is_started:
+            logger.warning(f"MTProto ishga tushmagan, yuklab bo'lmadi (msg={message_id})")
             return False
         try:
             msg = await self.client.get_messages(chat_id, ids=message_id)
             if not msg or not msg.media:
+                logger.warning(f"MTProto: Xabar topilmadi yoki media yo'q (chat={chat_id}, msg_id={message_id})")
                 return False
 
             last_edit = [0.0]
@@ -70,10 +100,13 @@ class MTProtoEngine:
                 if progress_callback and (now - last_edit[0] > 1.2 or received_bytes == total_bytes):
                     last_edit[0] = now
                     try:
-                        progress_callback(received_bytes, total_bytes)
+                        res = progress_callback(received_bytes, total_bytes)
+                        if asyncio.iscoroutine(res):
+                            asyncio.create_task(res)
                     except Exception:
                         pass
 
+            os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
             await self.client.download_media(
                 msg,
                 file=target_path,
@@ -108,7 +141,9 @@ class MTProtoEngine:
                 if progress_callback and (now - last_edit[0] > 1.2 or sent_bytes == total_bytes):
                     last_edit[0] = now
                     try:
-                        progress_callback(sent_bytes, total_bytes)
+                        res = progress_callback(sent_bytes, total_bytes)
+                        if asyncio.iscoroutine(res):
+                            asyncio.create_task(res)
                     except Exception:
                         pass
 
@@ -117,8 +152,13 @@ class MTProtoEngine:
             if fname:
                 attributes.append(DocumentAttributeFilename(file_name=fname))
 
+            try:
+                entity = await self.client.get_entity(chat_id)
+            except Exception:
+                entity = chat_id
+
             await self.client.send_file(
-                entity=chat_id,
+                entity=entity,
                 file=file_path,
                 caption=caption,
                 parse_mode='html',
@@ -133,3 +173,4 @@ class MTProtoEngine:
 
 
 mtproto_engine = MTProtoEngine()
+

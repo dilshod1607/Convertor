@@ -91,6 +91,7 @@ from keyboards import (
     get_cancel_keyboard
 )
 from session_manager import session_manager
+from mtproto_engine import mtproto_engine
 
 # Parallel og'ir konvertatsiyalar chegarasi (VPS xotirasini tejash uchun)
 CONVERT_SEMAPHORE = asyncio.Semaphore(3)
@@ -241,12 +242,14 @@ def reset_user_session(user_id: int):
 
 
 def format_file_size(size_bytes: int) -> str:
-    """Fayl hajmini chiroyli formatda ko'rsatish (KB, MB)"""
+    """Fayl hajmini chiroyli formatda ko'rsatish (KB, MB, GB)"""
     if not size_bytes or size_bytes <= 0:
         return ""
     if size_bytes < 1024 * 1024:
         return f"({size_bytes / 1024:.1f} KB)"
-    return f"({size_bytes / (1024 * 1024):.1f} MB)"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"({size_bytes / (1024 * 1024):.1f} MB)"
+    return f"({size_bytes / (1024 * 1024 * 1024):.2f} GB)"
 
 
 def build_progress_bar(current: int, total: int, title: str, current_info: str = "", start_time: float = None) -> str:
@@ -607,7 +610,9 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'file_id': photo.file_id,
                 'file_unique_id': photo.file_unique_id,
                 'file_name': f"photo_{photo.file_unique_id}.jpg",
-                'file_size': photo.file_size or 0
+                'file_size': photo.file_size or 0,
+                'message_id': message.message_id,
+                'chat_id': chat_id
             })
 
     # 2. Video yoki Animatsiya yuborilgan bo'lsa
@@ -620,7 +625,9 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'file_id': vid.file_id,
                 'file_unique_id': vid.file_unique_id,
                 'file_name': safe_name,
-                'file_size': vid.file_size or 0
+                'file_size': vid.file_size or 0,
+                'message_id': message.message_id,
+                'chat_id': chat_id
             })
 
     # 3. Audio / Ovozli xabar yuborilgan bo'lsa
@@ -633,7 +640,9 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'file_id': aud.file_id,
                 'file_unique_id': aud.file_unique_id,
                 'file_name': safe_name,
-                'file_size': aud.file_size or 0
+                'file_size': aud.file_size or 0,
+                'message_id': message.message_id,
+                'chat_id': chat_id
             })
 
     # 4. Hujjat / Fayl yuborilgan bo'lsa
@@ -672,7 +681,9 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'file_id': doc.file_id,
                 'file_unique_id': doc.file_unique_id,
                 'file_name': safe_name,
-                'file_size': doc.file_size or 0
+                'file_size': doc.file_size or 0,
+                'message_id': message.message_id,
+                'chat_id': chat_id
             })
 
     if session_manager.redis_client:
@@ -690,17 +701,29 @@ async def handle_user_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # =========================================================================
 
 async def _download_session_items(bot, items: list, user_dir: str, status_msg=None) -> list[str]:
-    """Kerakli fayllarni Telegramdan vaqtinchalik papkaga yuklab oladi (Progress Bar bilan)"""
+    """Kerakli fayllarni Telegramdan vaqtinchalik papkaga yuklab oladi (MTProto 2000 MB va Progress Bar bilan)"""
     downloaded_paths = []
     total = len(items)
     dl_start_time = time.time()
     for idx, it in enumerate(items, 1):
+        target_path = os.path.join(user_dir, f"{it['file_unique_id']}_{it['file_name']}")
+
+        # Agar fayl allaqachon to'liq yuklab olingan bo'lsa
+        if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+            downloaded_paths.append(target_path)
+            continue
+
+        file_size = it.get('file_size', 0)
+        file_name = it.get('file_name', 'Fayl')
+        message_id = it.get('message_id')
+        chat_id = it.get('chat_id')
+
         if status_msg:
             prog_text = build_progress_bar(
                 current=idx,
                 total=total,
                 title="Fayllar serverga yuklanmoqda...",
-                current_info=it.get('file_name', 'Fayl'),
+                current_info=f"{file_name} {format_file_size(file_size)}" if file_size else file_name,
                 start_time=dl_start_time
             )
             try:
@@ -708,9 +731,58 @@ async def _download_session_items(bot, items: list, user_dir: str, status_msg=No
             except Exception:
                 pass
 
-        file_obj = await bot.get_file(it['file_id'])
-        target_path = os.path.join(user_dir, f"{it['file_unique_id']}_{it['file_name']}")
-        await file_obj.download_to_drive(target_path)
+        downloaded = False
+        is_large = file_size >= 20 * 1024 * 1024
+
+        async def _mtproto_prog(received, total_b):
+            if status_msg and total_b > 0:
+                percent = int((received / total_b) * 100)
+                filled = int(percent / 10)
+                bar = "█" * filled + "░" * (10 - filled)
+                cur_mb = received / (1024 * 1024)
+                tot_mb = total_b / (1024 * 1024)
+                text = (
+                    f"⚙️ <b>Fayllar serverga yuklanmoqda... (MTProto 2GB)</b>\n\n"
+                    f"[{bar}] <b>{percent}%</b> ({idx}/{total})\n"
+                    f"📁 <b>Joriy:</b> <code>{file_name}</code>\n"
+                    f"⚡️ <b>Yuklandi:</b> {cur_mb:.1f} MB / {tot_mb:.1f} MB"
+                )
+                try:
+                    await status_msg.edit_text(text, parse_mode='HTML')
+                except Exception:
+                    pass
+
+        # 1. Agar fayl 20 MB dan katta bo'lsa -> MTProto orqali yuklash
+        if is_large and message_id and chat_id:
+            try:
+                downloaded = await mtproto_engine.download_media(
+                    message_id=message_id,
+                    chat_id=chat_id,
+                    target_path=target_path,
+                    progress_callback=_mtproto_prog
+                )
+            except Exception as e:
+                logger.warning(f"MTProto orqali yuklashda ogohlantirish: {e}")
+
+        # 2. Agar MTProto orqali olinmagan bo'lsa -> Bot API orqali yuklash
+        if not downloaded:
+            try:
+                file_obj = await bot.get_file(it['file_id'])
+                await file_obj.download_to_drive(target_path)
+                downloaded = os.path.exists(target_path) and os.path.getsize(target_path) > 0
+            except Exception as bot_api_err:
+                # Agar Bot API "File is too big" desa yoki boshqa xato bersa -> MTProto orqali qayta urinish
+                if message_id and chat_id and not downloaded:
+                    logger.info(f"Bot API yuklay olmadi ({bot_api_err}). MTProto orqali urinilmoqda...")
+                    downloaded = await mtproto_engine.download_media(
+                        message_id=message_id,
+                        chat_id=chat_id,
+                        target_path=target_path,
+                        progress_callback=_mtproto_prog
+                    )
+                if not downloaded:
+                    raise bot_api_err
+
         downloaded_paths.append(target_path)
     return downloaded_paths
 
@@ -1897,17 +1969,33 @@ async def _send_extracted_files(bot, user_id: int, extracted_items: list[dict], 
         file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
         caption = f"📁 <b>Papka:</b> <code>{item['rel_dir']}</code>\n📄 <b>Fayl:</b> {item['file_name']}"
 
-        # 50 MB dan katta fayllar Telegram bot orqali yuborilmaydi
+        # 50 MB dan katta fayllar MTProto (2000 MB) orqali yuboriladi
         if file_size > 50 * 1024 * 1024:
+            sent_large = False
             try:
-                await bot.send_message(
+                sent_large = await mtproto_engine.send_file(
                     chat_id=user_id,
-                    text=f"⚠️ <b>Fayl hajmi 50 MB dan katta:</b>\n📁 <code>{item['rel_dir']}/{item['file_name']}</code> {format_file_size(file_size)}\n<i>Telegram cheklovi tufayli bot bu faylni yubora olmaydi.</i>",
-                    parse_mode='HTML'
+                    file_path=file_path,
+                    caption=caption,
+                    file_name=item['file_name']
                 )
-            except Exception:
-                pass
-            continue
+            except Exception as e:
+                logger.warning(f"MTProto send_file error: {e}")
+
+            if sent_large:
+                successfully_sent += 1
+                await asyncio.sleep(0.4)
+                continue
+            else:
+                try:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=f"⚠️ <b>Fayl hajmi juda katta (2 GB dan ortiq):</b>\n📁 <code>{item['rel_dir']}/{item['file_name']}</code> {format_file_size(file_size)}\n<i>Telegram cheklovi tufayli bu faylni yuborib bo'lmadi.</i>",
+                        parse_mode='HTML'
+                    )
+                except Exception:
+                    pass
+                continue
 
         try:
             if file_size == 0:
@@ -2159,16 +2247,30 @@ async def make_zip_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        with open(output_zip, 'rb') as zip_file:
-            await context.bot.send_document(
+        zip_size = os.path.getsize(output_zip)
+        zip_cap = with_caption_ad(f"✅ <b>Barcha fayllar ZIP arxiviga muvaffaqiyatli jamlandi!</b>\n\n📦 <b>Jami fayllar:</b> {len(downloaded_paths)} ta\n💾 <b>Hajmi:</b> {format_file_size(zip_size)}\n🤖 @convertoral_bot")
+        zip_fname = f"Archive_{int(time.time())}.zip"
+
+        if zip_size > 50 * 1024 * 1024:
+            sent_zip = await mtproto_engine.send_file(
                 chat_id=user_id,
-                document=zip_file,
-                filename=f"Archive_{int(time.time())}.zip",
-                caption=with_caption_ad(f"✅ <b>Barcha fayllar ZIP arxiviga muvaffaqiyatli jamlandi!</b>\n\n📦 <b>Jami fayllar:</b> {len(downloaded_paths)} ta\n🤖 @convertoral_bot"),
-                parse_mode='HTML',
-                read_timeout=120.0,
-                write_timeout=120.0
+                file_path=output_zip,
+                caption=zip_cap,
+                file_name=zip_fname
             )
+            if not sent_zip:
+                await progress_msg.edit_text("❌ ZIP arxiv hajmi 2 GB dan katta bo'lgani uchun yuborib bo'lmadi.")
+        else:
+            with open(output_zip, 'rb') as zip_file:
+                await context.bot.send_document(
+                    chat_id=user_id,
+                    document=zip_file,
+                    filename=zip_fname,
+                    caption=zip_cap,
+                    parse_mode='HTML',
+                    read_timeout=120.0,
+                    write_timeout=120.0
+                )
         try:
             await progress_msg.delete()
         except Exception:
@@ -3891,12 +3993,25 @@ def main():
         except Exception as e:
             logger.warning(f"Menu button set error: {e}")
 
+        # MTProto 2000 MB dvigatelini fonda ishga tushirish
+        try:
+            await mtproto_engine.start()
+        except Exception as e:
+            logger.warning(f"MTProto start error: {e}")
+
+    async def post_shutdown(app):
+        try:
+            await mtproto_engine.stop()
+        except Exception as e:
+            logger.warning(f"MTProto stop error: {e}")
+
     application = (
         ApplicationBuilder()
         .token(API_TOKEN)
         .request(req)
         .concurrent_updates(True)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .build()
     )
 
